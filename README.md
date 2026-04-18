@@ -6,10 +6,12 @@ built with [ModernGL](https://moderngl.readthedocs.io/) and
 fragment shader using a ping-pong of textures, so the grid scales smoothly and
 the rendering stays at hundreds of FPS even with the bloom-style post-processing.
 
-![Game of Life — GPU](screenshot.png)
+![Game of Life — GPU](demo.gif)
 
-Capture above: a Gosper glider gun (top-left), a pulsar (right) and the
-chaotic remains of an R-pentomino (bottom), 90 generations in.
+*([Also available as MP4](demo.mp4) — 90 KB instead of 3.9 MB.)*
+
+The capture shows a Gosper glider gun (top-left), a pulsar (right) and the
+chaotic remains of an R-pentomino (bottom), running live.
 
 ## Features
 
