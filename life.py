@@ -46,10 +46,11 @@ void main() {
 }
 """
 
-# Le canal R contient l'état (0/1), G contient un compteur d'âge normalisé
-# qui décroît quand la cellule meurt (sert à la traînée à l'affichage).
-# u_birth / u_survive sont des bitmasks (bit i = comportement avec i voisines)
-# permettant de changer de règle sans recompiler le shader.
+# Canal R : état (0/1). Canal G : âge normalisé qui décroît quand la cellule
+# meurt (sert à la traînée). La texture est en RG8 (unorm) — GLSL lit les
+# échantillons comme des floats 0..1, on divise la bande passante par 8 vs
+# l'ancien RGBA32F sans modifier les shaders.
+# u_birth / u_survive : bitmasks (bit i = comportement avec i voisines).
 SIM_SHADER = """
 #version 330
 uniform sampler2D u_state;
@@ -99,11 +100,78 @@ void main() {
 }
 """
 
-# Rendu final : couleurs cyan→magenta selon l'âge, lueur additive,
-# fond sombre avec léger vignettage.
+# Stamp d'un motif sur la grille, entièrement GPU (évite un aller-retour
+# lecture/écriture numpy). Le motif est uploadé dans u_pattern ; on sample
+# l'état d'entrée puis on écrase là où le motif est à 1. `fract(d + 0.5) - 0.5`
+# assure le wrap toroïdal sans logique spéciale aux bords.
+STAMP_SHADER = """
+#version 330
+uniform sampler2D u_state;
+uniform sampler2D u_pattern;
+uniform vec2 u_cursor_tex;     // centre du motif en UV de la texture d'état
+uniform vec2 u_pattern_size;   // taille du motif en UV de la texture d'état
+in vec2 v_uv;
+out vec4 frag;
+
+void main() {
+    vec4 cur = texture(u_state, v_uv);
+    vec2 d = v_uv - u_cursor_tex;
+    d = fract(d + 0.5) - 0.5;
+    vec2 p = d / u_pattern_size + 0.5;
+    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) {
+        float a = texture(u_pattern, p).r;
+        if (a > 0.5) {
+            cur.r = 1.0;
+            cur.g = max(cur.g, 1.0);
+        }
+    }
+    frag = cur;
+}
+"""
+
+# Copie state.r dans une texture R32F pour la réduction mipmap
+# (moyenne → fraction de vivantes → count). Passe en float pour éviter la
+# perte de précision des formats unorm sur les petits comptages.
+REDUCE_SHADER = """
+#version 330
+uniform sampler2D u_state;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    frag = vec4(texture(u_state, v_uv).r, 0.0, 0.0, 1.0);
+}
+"""
+
+# Flou gaussien : passe horizontale, 7 taps. Rend à la résolution écran dans
+# une texture R8 intermédiaire ; la passe verticale est fusionnée dans le
+# display shader. Au total 7+7=14 taps par pixel écran au lieu de 7×7=49.
+GLOW_H_SHADER = """
+#version 330
+uniform sampler2D u_state;
+uniform vec2  u_center;
+uniform float u_zoom;
+in vec2 v_uv;
+out vec4 frag;
+
+void main() {
+    vec2 uv = (v_uv - 0.5) * u_zoom + u_center;
+    float pxx = u_zoom / float(textureSize(u_state, 0).x);
+    float acc = 0.0, wsum = 0.0;
+    for (int dx = -3; dx <= 3; dx++) {
+        float w = exp(-float(dx*dx) / 6.0);
+        acc  += texture(u_state, uv + vec2(float(dx) * pxx, 0.0)).g * w;
+        wsum += w;
+    }
+    frag = vec4(acc / wsum, 0.0, 0.0, 1.0);
+}
+"""
+
+# Rendu final : palette cyan→magenta selon l'âge, lueur additive (passe V du
+# flou séparable, lit la passe H précalculée), fond sombre et vignettage.
 DISPLAY_SHADER = """
 #version 330
 uniform sampler2D u_state;
+uniform sampler2D u_glow_h;
 uniform float u_time;
 uniform vec2  u_center;   // UV du centre de la vue
 uniform float u_zoom;     // largeur (en UV) visible à l'écran
@@ -116,24 +184,16 @@ vec3 palette(float t) {
     return mix(a, b, smoothstep(0.0, 1.0, t));
 }
 
-vec2 view_uv(vec2 p) {
-    return (p - 0.5) * u_zoom + u_center;
-}
-
 void main() {
-    vec2 uv = view_uv(v_uv);
-    vec2 px = (1.0 / vec2(textureSize(u_state, 0))) * u_zoom;
-    vec4 s = texture(u_state, uv);
+    vec2 uv = (v_uv - 0.5) * u_zoom + u_center;
+    vec4 s  = texture(u_state, uv);
 
-    // glow : gaussien 7x7, échelle suit le zoom pour rester visuellement constant
-    float glow = 0.0;
-    float wsum = 0.0;
+    float pxy = u_zoom / float(textureSize(u_state, 0).y);
+    float glow = 0.0, wsum = 0.0;
     for (int dy = -3; dy <= 3; dy++) {
-        for (int dx = -3; dx <= 3; dx++) {
-            float w = exp(-(dx*dx + dy*dy) / 6.0);
-            glow += texture(u_state, uv + vec2(dx, dy) * px).g * w;
-            wsum += w;
-        }
+        float w = exp(-float(dy*dy) / 6.0);
+        glow += texture(u_glow_h, v_uv + vec2(0.0, float(dy) * pxy)).r * w;
+        wsum += w;
     }
     glow /= wsum;
 
@@ -303,10 +363,11 @@ def make_program(ctx, fragment):
 
 
 def random_state(w, h, density=0.25):
-    arr = np.zeros((h, w, 4), dtype=np.float32)
-    mask = np.random.random((h, w)) < density
-    arr[..., 0] = mask.astype(np.float32)
-    arr[..., 1] = mask.astype(np.float32)
+    """État aléatoire en RG8 : shape (h, w, 2), uint8. R = alive, G = age."""
+    mask = (np.random.random((h, w)) < density).astype(np.uint8) * 255
+    arr = np.zeros((h, w, 2), dtype=np.uint8)
+    arr[..., 0] = mask
+    arr[..., 1] = mask
     return arr
 
 
@@ -328,18 +389,25 @@ def main():
 
     sim_prog     = make_program(ctx, SIM_SHADER)
     paint_prog   = make_program(ctx, PAINT_SHADER)
+    stamp_prog   = make_program(ctx, STAMP_SHADER)
+    reduce_prog  = make_program(ctx, REDUCE_SHADER)
+    glow_h_prog  = make_program(ctx, GLOW_H_SHADER)
     display_prog = make_program(ctx, DISPLAY_SHADER)
     preview_prog = make_program(ctx, PREVIEW_SHADER)
     hud_prog     = make_program(ctx, HUD_SHADER)
 
     sim_vao     = ctx.simple_vertex_array(sim_prog,     quad, "in_pos")
     paint_vao   = ctx.simple_vertex_array(paint_prog,   quad, "in_pos")
+    stamp_vao   = ctx.simple_vertex_array(stamp_prog,   quad, "in_pos")
+    reduce_vao  = ctx.simple_vertex_array(reduce_prog,  quad, "in_pos")
+    glow_h_vao  = ctx.simple_vertex_array(glow_h_prog,  quad, "in_pos")
     display_vao = ctx.simple_vertex_array(display_prog, quad, "in_pos")
     preview_vao = ctx.simple_vertex_array(preview_prog, quad, "in_pos")
     hud_vao     = ctx.simple_vertex_array(hud_prog,     quad, "in_pos")
 
     def make_tex(initial=None):
-        tex = ctx.texture((GRID_W, GRID_H), 4, dtype="f4")
+        # RG8 : R = alive (0/255), G = age (0..255). 2 o/cellule au lieu de 16.
+        tex = ctx.texture((GRID_W, GRID_H), 2, dtype="f1")
         tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         tex.repeat_x = tex.repeat_y = True
         if initial is not None:
@@ -347,7 +415,7 @@ def main():
         return tex
 
     tex_a = make_tex(random_state(GRID_W, GRID_H))
-    tex_b = make_tex(np.zeros((GRID_H, GRID_W, 4), dtype=np.float32))
+    tex_b = make_tex(np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8))
     fbo_a = ctx.framebuffer(color_attachments=[tex_a])
     fbo_b = ctx.framebuffer(color_attachments=[tex_b])
 
@@ -355,6 +423,31 @@ def main():
 
     def swap():
         state["front"], state["back"] = state["back"], state["front"]
+
+    # Réduction pour compter les vivantes : texture R32F à la résolution de
+    # la grille + chaîne de mipmaps. Lire le top-level 1×1 donne la fraction
+    # de cellules vivantes, qu'on multiplie par GRID_W*GRID_H.
+    reduce_tex = ctx.texture((GRID_W, GRID_H), 1, dtype="f4")
+    reduce_tex.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
+    reduce_fbo = ctx.framebuffer(color_attachments=[reduce_tex])
+    reduce_max_level = int(math.floor(math.log2(max(GRID_W, GRID_H))))
+
+    # Passe H du glow : texture R8 à la résolution écran, recréée à la volée
+    # quand la taille change.
+    glow = {"tex": None, "fbo": None, "size": (0, 0)}
+
+    def ensure_glow_tex(w, h):
+        if glow["size"] == (w, h):
+            return
+        if glow["tex"] is not None:
+            glow["tex"].release()
+            glow["fbo"].release()
+        tex = ctx.texture((w, h), 1, dtype="f1")
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        fbo = ctx.framebuffer(color_attachments=[tex])
+        glow["tex"] = tex
+        glow["fbo"] = fbo
+        glow["size"] = (w, h)
 
     sim = {"rule_idx": 0}  # dict pour pouvoir muter depuis les closures
 
@@ -384,7 +477,7 @@ def main():
         swap()
 
     def clear_grid():
-        zeros = np.zeros((GRID_H, GRID_W, 4), dtype=np.float32)
+        zeros = np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8)
         state["front"][0].write(zeros.tobytes())
 
     def randomize():
@@ -429,32 +522,44 @@ def main():
         lz += (math.log(view["tzoom"]) - lz) * k
         view["zoom"] = math.exp(lz)
 
+    def upload_pattern_tex(pat):
+        """Uploade un motif 2D dans une texture R32F. L'appelant possède la texture."""
+        p = np.flipud(pat).astype(np.float32)
+        h, w = p.shape
+        tex = ctx.texture((w, h), 1, p.tobytes(), dtype="f4")
+        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        return tex
+
     def stamp(pattern, pos):
-        h, w = pattern.shape
-        cx_uv, cy_uv = view_uv(pos)
-        cx_px = int(cx_uv * GRID_W) - w // 2
-        cy_px = int(cy_uv * GRID_H) - h // 2
-        # buffer : row 0 = bas de l'écran ; pattern : row 0 = haut visuel.
-        p = np.flipud(pattern)
-        front_tex = state["front"][0]
-        buf = np.frombuffer(front_tex.read(), dtype=np.float32) \
-                .reshape(GRID_H, GRID_W, 4).copy()
-        ys, xs = np.where(p > 0.5)
-        by = (cy_px + ys) % GRID_H
-        bx = (cx_px + xs) % GRID_W
-        buf[by, bx, 0] = 1.0
-        buf[by, bx, 1] = np.maximum(buf[by, bx, 1], 1.0)
-        front_tex.write(buf.tobytes())
+        """Pose un motif sur la grille, entièrement GPU (pas de round-trip CPU)."""
+        tex = upload_pattern_tex(pattern)
+        try:
+            cx_uv, cy_uv = view_uv(pos)
+            h, w = pattern.shape
+            front_tex = state["front"][0]
+            _, back_fbo = state["back"]
+            back_fbo.use()
+            ctx.viewport = (0, 0, GRID_W, GRID_H)
+            front_tex.use(0)
+            tex.use(1)
+            stamp_prog["u_state"]        = 0
+            stamp_prog["u_pattern"]      = 1
+            stamp_prog["u_cursor_tex"]   = (cx_uv, cy_uv)
+            stamp_prog["u_pattern_size"] = (w / GRID_W, h / GRID_H)
+            stamp_vao.render(moderngl.TRIANGLE_STRIP)
+            swap()
+        finally:
+            tex.release()
 
     SNAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
 
     def save_png():
         os.makedirs(SNAP_DIR, exist_ok=True)
         front_tex = state["front"][0]
-        buf = np.frombuffer(front_tex.read(), dtype=np.float32) \
-                .reshape(GRID_H, GRID_W, 4)
+        buf = np.frombuffer(front_tex.read(), dtype=np.uint8) \
+                .reshape(GRID_H, GRID_W, 2)
         # canal R = vivant ; on flip Y pour que l'image PNG soit "à l'endroit"
-        img = (np.flipud(buf[..., 0]) * 255).astype(np.uint8)
+        img = np.flipud(buf[..., 0])
         rgb = np.stack([img, img, img], axis=-1)
         surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
         path = os.path.join(SNAP_DIR, time.strftime("life_%Y%m%d_%H%M%S.png"))
@@ -479,9 +584,9 @@ def main():
             sw, sh = surf.get_size()
         canvas.blit(surf, ((GRID_W - sw) // 2, (GRID_H - sh) // 2))
         arr = pygame.surfarray.array3d(canvas).swapaxes(0, 1)  # (H, W, 3)
-        alive = (arr[..., 0] > 127).astype(np.float32)
+        alive = (arr[..., 0] > 127).astype(np.uint8) * 255
         alive = np.flipud(alive)  # PNG y=0 en haut → buffer y=0 en bas
-        buf = np.zeros((GRID_H, GRID_W, 4), dtype=np.float32)
+        buf = np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8)
         buf[..., 0] = alive
         buf[..., 1] = alive
         state["front"][0].write(buf.tobytes())
@@ -507,11 +612,7 @@ def main():
             pattern_tex["tex"] = None
         if place["pattern"] is None:
             return
-        p = np.flipud(place["pattern"]).astype("f4")
-        h, w = p.shape
-        tex = ctx.texture((w, h), 1, p.tobytes(), dtype="f4")
-        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        pattern_tex["tex"] = tex
+        pattern_tex["tex"] = upload_pattern_tex(place["pattern"])
 
     def enter_place(key):
         name, base = PATTERNS[key]
@@ -558,7 +659,12 @@ def main():
         "ECHAP     quitter (ou annule le placement)"
     )
 
-    def draw_hud_surface(surf, pos, anchor="topleft"):
+    # cache de textures HUD pour éviter l'alloc/release à chaque frame.
+    # Clé = label ; valeur = (texture, (w, h)). Recrée uniquement à changement
+    # de taille ; sinon .write() écrase le contenu.
+    hud_textures = {}
+
+    def draw_hud_surface(surf, pos, anchor="topleft", label="default"):
         w, h = surf.get_size()
         sw, sh = pygame.display.get_surface().get_size()
         if anchor == "topleft":      x, y = pos
@@ -567,15 +673,22 @@ def main():
         elif anchor == "topcenter":  x, y = (sw - w) // 2, pos[1]
         else:                         x, y = pos
         data = pygame.image.tobytes(surf, "RGBA", True)
-        tex = ctx.texture((w, h), 4, data)
-        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        cached = hud_textures.get(label)
+        if cached is None or cached[1] != (w, h):
+            if cached is not None:
+                cached[0].release()
+            tex = ctx.texture((w, h), 4)
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            hud_textures[label] = (tex, (w, h))
+        else:
+            tex = cached[0]
+        tex.write(data)
         tex.use(0)
         hud_prog["u_hud"]       = 0
         hud_prog["u_pos_px"]    = (float(x), float(y))
         hud_prog["u_size_px"]   = (float(w), float(h))
         hud_prog["u_screen_px"] = (float(sw), float(sh))
         hud_vao.render(moderngl.TRIANGLE_STRIP)
-        tex.release()
 
     def make_panel(lines, font, padding=(10, 8), bg=(10, 12, 22, 165),
                    fg=(235, 235, 245)):
@@ -600,10 +713,19 @@ def main():
         now = pygame.time.get_ticks()
         if now - counters["alive_at"] < 500:
             return
-        front_tex = state["front"][0]
-        buf = np.frombuffer(front_tex.read(), dtype=np.float32) \
-                .reshape(GRID_H, GRID_W, 4)
-        counters["alive"] = int((buf[..., 0] > 0.5).sum())
+        # 1) copie state.r dans reduce_tex (R32F)
+        reduce_fbo.use()
+        ctx.viewport = (0, 0, GRID_W, GRID_H)
+        state["front"][0].use(0)
+        reduce_prog["u_state"] = 0
+        reduce_vao.render(moderngl.TRIANGLE_STRIP)
+        # 2) chaîne de mipmaps : chaque niveau moyenne 2x2 du précédent,
+        #    le top-level (1×1) contient la moyenne de toutes les cellules.
+        reduce_tex.build_mipmaps()
+        # 3) lecture du top-level (4 octets) — pas de readback de toute la grille
+        raw = reduce_tex.read(level=reduce_max_level)
+        fraction = float(np.frombuffer(raw, dtype=np.float32)[0])
+        counters["alive"] = int(round(fraction * GRID_W * GRID_H))
         counters["alive_at"] = now
 
     def flash_msg(text, ms=1500):
@@ -620,11 +742,23 @@ def main():
         return sw, sh
 
     def _render_frame(sw, sh, time_s, with_help):
+        ensure_glow_tex(sw, sh)
+        # passe H du glow (écrit dans glow["tex"])
+        glow["fbo"].use()
+        ctx.viewport = (0, 0, sw, sh)
+        state["front"][0].use(0)
+        glow_h_prog["u_state"]  = 0
+        glow_h_prog["u_center"] = (0.5, 0.5)
+        glow_h_prog["u_zoom"]   = 1.0
+        glow_h_vao.render(moderngl.TRIANGLE_STRIP)
+        # composition finale (passe V du glow + cellules + fond)
         ctx.screen.use()
         ctx.viewport = (0, 0, sw, sh)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         state["front"][0].use(0)
+        glow["tex"].use(1)
         display_prog["u_state"]  = 0
+        display_prog["u_glow_h"] = 1
         display_prog["u_time"]   = time_s
         display_prog["u_center"] = (0.5, 0.5)
         display_prog["u_zoom"]   = 1.0
@@ -633,10 +767,10 @@ def main():
         status = (f"Gen {counters['gen']:>6}  ·  {counters['alive']:>5} vivantes  "
                   f"·  {tps:>3} TPS  ·  {rule_name}  ·  PLAY")
         draw_hud_surface(make_panel(status, font_main), (12, 12),
-                         anchor="bottomleft")
+                         anchor="bottomleft", label="status")
         if with_help:
             draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
-                             anchor="topright")
+                             anchor="topright", label="help")
 
     def _save_screen_png(sw, sh, path):
         data = ctx.screen.read(components=3, dtype="f1")
@@ -656,6 +790,46 @@ def main():
         _save_screen_png(sw, sh, out_path)
         pygame.quit()
         print(f"Capture : {out_path}")
+        return
+
+    # Mode benchmark : mesure ns/step de sim, ns/frame de rendu, ns/maj du
+    # compteur de vivantes. Utile pour comparer l'impact d'une optimisation.
+    if "--bench" in sys.argv:
+        i = sys.argv.index("--bench")
+        n = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 2000
+        randomize()
+        sw, sh = pygame.display.get_surface().get_size()
+
+        # warmup : compile, upload, premier render.
+        for _ in range(200):
+            step()
+        _render_frame(sw, sh, time_s=0.0, with_help=True)
+        ctx.finish()
+
+        t0 = time.perf_counter()
+        for _ in range(n):
+            step()
+        ctx.finish()
+        dt_sim = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for k in range(n):
+            _render_frame(sw, sh, time_s=k * 0.02, with_help=True)
+        ctx.finish()
+        dt_render = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for _ in range(n):
+            counters["alive_at"] = 0
+            update_alive_count()
+        ctx.finish()
+        dt_count = time.perf_counter() - t0
+
+        print(f"bench N={n}  screen {sw}x{sh}  grid {GRID_W}x{GRID_H}")
+        print(f"  sim    : {dt_sim*1e6/n:8.1f} us/step   ({n/dt_sim:8.0f} steps/s)")
+        print(f"  render : {dt_render*1e6/n:8.1f} us/frame  ({n/dt_render:8.0f} frames/s)")
+        print(f"  count  : {dt_count*1e6/n:8.1f} us/call   ({n/dt_count:8.0f} calls/s)")
+        pygame.quit()
         return
 
     # Mode capture animée : dump N frames PNG (assemblage GIF via ffmpeg ensuite).
@@ -804,14 +978,27 @@ def main():
         update_alive_count()
 
         # ── rendu écran ─────────────────────────────────────────
-        ctx.screen.use()
         w, h = pygame.display.get_surface().get_size()
+        ensure_glow_tex(w, h)
+
+        # 0) passe H du glow (R8, résolution écran)
+        glow["fbo"].use()
+        ctx.viewport = (0, 0, w, h)
+        state["front"][0].use(0)
+        glow_h_prog["u_state"]  = 0
+        glow_h_prog["u_center"] = (view["cx"], view["cy"])
+        glow_h_prog["u_zoom"]   = view["zoom"]
+        glow_h_vao.render(moderngl.TRIANGLE_STRIP)
+
+        ctx.screen.use()
         ctx.viewport = (0, 0, w, h)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        # 1) état
+        # 1) composition finale (passe V + cellules + fond + vignette + dither)
         state["front"][0].use(0)
+        glow["tex"].use(1)
         display_prog["u_state"]  = 0
+        display_prog["u_glow_h"] = 1
         display_prog["u_time"]   = pygame.time.get_ticks() / 1000.0 - t0
         display_prog["u_center"] = (view["cx"], view["cy"])
         display_prog["u_zoom"]   = view["zoom"]
@@ -836,23 +1023,23 @@ def main():
                   f"·  {clock.get_fps():3.0f} FPS  ·  {tps:>3} TPS  "
                   f"·  {rule_name}  ·  {'PAUSE' if paused else 'PLAY'}")
         draw_hud_surface(make_panel(status, font_main), (12, 12),
-                         anchor="bottomleft")
+                         anchor="bottomleft", label="status")
 
         if show_help:
             draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
-                             anchor="topright")
+                             anchor="topright", label="help")
 
         if place["pattern"] is not None:
             label = f"▸ {place['name']}   Q/E rotation · clic gauche : pose · Esc : annule"
             draw_hud_surface(
                 make_panel(label, font_main, bg=(120, 80, 20, 200)),
-                (0, 12), anchor="topcenter")
+                (0, 12), anchor="topcenter", label="placement")
 
         if pygame.time.get_ticks() < flash["until"]:
             draw_hud_surface(
                 make_panel(flash["text"], font_big, padding=(18, 14),
                            bg=(20, 25, 50, 200), fg=(255, 240, 200)),
-                (0, 60), anchor="topcenter")
+                (0, 60), anchor="topcenter", label="flash")
 
         pygame.display.flip()
 

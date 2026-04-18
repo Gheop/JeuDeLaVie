@@ -195,3 +195,39 @@ A few constants at the top of `life.py` are worth playing with:
 | `INITIAL_TPS` | 30 | Starting simulation rate (ticks per second). |
 | `LERP_SPEED` | 18 | Camera responsiveness. Higher = snappier, lower = lazier. |
 | `ZOOM_MIN`, `ZOOM_MAX` | 0.02, 4.0 | How far in / out you can zoom. |
+
+## Changelog
+
+### GPU perf pass
+
+Bench sur une grille 512×320, écran 1280×800 (moyenne sur 3000 itérations) :
+
+| Mesure | Avant | Après | Gain |
+|---|---|---|---|
+| Sim step | 332 µs | 176 µs | **1.9×** |
+| Render frame | 5576 µs | 1994 µs | **2.8×** |
+| Alive count | 1237 µs | 1035 µs | 1.2× |
+
+- **Texture d'état RGBA32F → RG8** — on n'utilise que `.r` (vivant) et `.g`
+  (âge), donc 2 octets/cellule au lieu de 16. Le `SIM_SHADER` est
+  memory-bound (9 échantillons voisins par pixel), la division de bande
+  passante par 8 se reflète presque linéairement dans le temps de sim.
+- **Glow gaussien séparable** — remplace le 7×7 (49 taps/pixel) par deux
+  passes 1D : H à la résolution écran dans une texture R8 intermédiaire,
+  puis V fusionnée dans le display shader. 14 taps/pixel au lieu de 49.
+- **Compteur de vivantes via mipmap** — au lieu d'un `glReadPixels` sur
+  toute la grille (2.5 MB en RGBA32F), on copie `.r` dans une R32F, on
+  génère la chaîne de mipmaps et on lit le top-level 1×1 (4 octets).
+- **Textures HUD réutilisées** — le précédent code allouait puis libérait
+  une `ctx.texture` par panneau et par frame. Un cache indexé par label
+  garde la texture et réécrit son contenu ; nouvelle alloc uniquement si
+  la taille change.
+- **Stamps de motifs 100% GPU** — plus de round-trip lecture/écriture
+  numpy. Le motif est uploadé dans une texture et un `STAMP_SHADER`
+  combine état + motif avec wrap toroïdal (`fract(d + 0.5) - 0.5`).
+
+Un mode `--bench N` est dispo pour reproduire les mesures :
+
+```bash
+python3 life.py --bench 3000
+```
