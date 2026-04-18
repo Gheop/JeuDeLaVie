@@ -200,33 +200,34 @@ A few constants at the top of `life.py` are worth playing with:
 
 ### GPU perf pass
 
-Bench sur une grille 512×320, écran 1280×800 (moyenne sur 3000 itérations) :
+Benchmarked on a 512×320 grid at 1280×800 (averaged over 3000 iterations):
 
-| Mesure | Avant | Après | Gain |
+| Measurement | Before | After | Speedup |
 |---|---|---|---|
 | Sim step | 332 µs | 176 µs | **1.9×** |
 | Render frame | 5576 µs | 1994 µs | **2.8×** |
 | Alive count | 1237 µs | 1035 µs | 1.2× |
 
-- **Texture d'état RGBA32F → RG8** — on n'utilise que `.r` (vivant) et `.g`
-  (âge), donc 2 octets/cellule au lieu de 16. Le `SIM_SHADER` est
-  memory-bound (9 échantillons voisins par pixel), la division de bande
-  passante par 8 se reflète presque linéairement dans le temps de sim.
-- **Glow gaussien séparable** — remplace le 7×7 (49 taps/pixel) par deux
-  passes 1D : H à la résolution écran dans une texture R8 intermédiaire,
-  puis V fusionnée dans le display shader. 14 taps/pixel au lieu de 49.
-- **Compteur de vivantes via mipmap** — au lieu d'un `glReadPixels` sur
-  toute la grille (2.5 MB en RGBA32F), on copie `.r` dans une R32F, on
-  génère la chaîne de mipmaps et on lit le top-level 1×1 (4 octets).
-- **Textures HUD réutilisées** — le précédent code allouait puis libérait
-  une `ctx.texture` par panneau et par frame. Un cache indexé par label
-  garde la texture et réécrit son contenu ; nouvelle alloc uniquement si
-  la taille change.
-- **Stamps de motifs 100% GPU** — plus de round-trip lecture/écriture
-  numpy. Le motif est uploadé dans une texture et un `STAMP_SHADER`
-  combine état + motif avec wrap toroïdal (`fract(d + 0.5) - 0.5`).
+- **State texture RGBA32F → RG8** — we only use `.r` (alive) and `.g`
+  (age), so 2 bytes/cell instead of 16. `SIM_SHADER` is memory-bound
+  (9 neighbor fetches per pixel), so the 8× bandwidth cut translates
+  almost linearly to simulation time.
+- **Separable Gaussian glow** — replaces the 7×7 kernel (49 taps/pixel)
+  with two 1D passes: H at screen resolution into an intermediate R8
+  texture, then V fused into the display shader. 14 taps/pixel instead
+  of 49.
+- **Alive count via mipmap** — instead of a `glReadPixels` of the whole
+  grid (2.5 MB in RGBA32F), we copy `.r` into an R32F, generate the
+  mipmap chain and read the 1×1 top level (4 bytes).
+- **Cached HUD textures** — the previous code allocated then released a
+  `ctx.texture` per panel per frame. A label-keyed cache holds the
+  texture and rewrites its contents; a new allocation is only needed
+  when the size changes.
+- **Pattern stamps fully on GPU** — no more numpy read/write round-trip.
+  The pattern is uploaded into a texture and a `STAMP_SHADER` combines
+  state + pattern with toroidal wrap (`fract(d + 0.5) - 0.5`).
 
-Un mode `--bench N` est dispo pour reproduire les mesures :
+A `--bench N` mode reproduces the measurements:
 
 ```bash
 python3 life.py --bench 3000
