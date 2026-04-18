@@ -610,45 +610,71 @@ def main():
         flash["text"] = text
         flash["until"] = pygame.time.get_ticks() + ms
 
-    # Mode capture : scénarise une scène sympa, rend une frame, sauvegarde, sort.
-    if "--screenshot" in sys.argv:
-        out_path = sys.argv[sys.argv.index("--screenshot") + 1]
+    def _scene_setup():
+        """Pose une scène vivante pour les captures (gun + pulsar + méthuselah)."""
         clear_grid()
         sw, sh = pygame.display.get_surface().get_size()
-        # canon de Gosper en haut-gauche, pulsar à droite, R-pentomino en bas
-        stamp(PATTERNS[pygame.K_7][1], (int(0.20 * sw), int(0.30 * sh)))
-        stamp(PATTERNS[pygame.K_5][1], (int(0.72 * sw), int(0.40 * sh)))
-        stamp(PATTERNS[pygame.K_8][1], (int(0.50 * sw), int(0.75 * sh)))
-        for _ in range(90):
-            step_counted()
-        update_alive_count()
+        stamp(PATTERNS[pygame.K_7][1], (int(0.18 * sw), int(0.30 * sh)))  # Gosper
+        stamp(PATTERNS[pygame.K_5][1], (int(0.72 * sw), int(0.40 * sh)))  # Pulsar
+        stamp(PATTERNS[pygame.K_8][1], (int(0.50 * sw), int(0.78 * sh)))  # R-pent
+        return sw, sh
 
+    def _render_frame(sw, sh, time_s, with_help):
         ctx.screen.use()
         ctx.viewport = (0, 0, sw, sh)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         state["front"][0].use(0)
         display_prog["u_state"]  = 0
-        display_prog["u_time"]   = 1.5
+        display_prog["u_time"]   = time_s
         display_prog["u_center"] = (0.5, 0.5)
         display_prog["u_zoom"]   = 1.0
         display_vao.render(moderngl.TRIANGLE_STRIP)
-
         rule_name = RULES[sim["rule_idx"]][0]
         status = (f"Gen {counters['gen']:>6}  ·  {counters['alive']:>5} vivantes  "
                   f"·  {tps:>3} TPS  ·  {rule_name}  ·  PLAY")
         draw_hud_surface(make_panel(status, font_main), (12, 12),
                          anchor="bottomleft")
-        draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
-                         anchor="topright")
+        if with_help:
+            draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
+                             anchor="topright")
 
-        # lecture du framebuffer (avant le swap)
+    def _save_screen_png(sw, sh, path):
         data = ctx.screen.read(components=3, dtype="f1")
         img = np.frombuffer(data, dtype=np.uint8).reshape(sh, sw, 3)
-        img = np.flipud(img)  # GL Y → image Y
+        img = np.flipud(img)
         surf = pygame.surfarray.make_surface(img.swapaxes(0, 1))
-        pygame.image.save(surf, out_path)
+        pygame.image.save(surf, path)
+
+    # Mode capture fixe : scène figée après 90 générations.
+    if "--screenshot" in sys.argv:
+        out_path = sys.argv[sys.argv.index("--screenshot") + 1]
+        sw, sh = _scene_setup()
+        for _ in range(90):
+            step_counted()
+        update_alive_count()
+        _render_frame(sw, sh, time_s=1.5, with_help=True)
+        _save_screen_png(sw, sh, out_path)
         pygame.quit()
         print(f"Capture : {out_path}")
+        return
+
+    # Mode capture animée : dump N frames PNG (assemblage GIF via ffmpeg ensuite).
+    if "--frames" in sys.argv:
+        i = sys.argv.index("--frames")
+        out_dir   = sys.argv[i + 1]
+        n_frames  = int(sys.argv[i + 2])
+        stride    = int(sys.argv[i + 3]) if len(sys.argv) > i + 3 else 1
+        os.makedirs(out_dir, exist_ok=True)
+        sw, sh = _scene_setup()
+        for f in range(n_frames):
+            for _ in range(stride):
+                step_counted()
+            if f % 5 == 0:
+                update_alive_count()
+            _render_frame(sw, sh, time_s=f * 0.04, with_help=False)
+            _save_screen_png(sw, sh, os.path.join(out_dir, f"frame_{f:04d}.png"))
+        pygame.quit()
+        print(f"Capture : {n_frames} frames → {out_dir}")
         return
 
     running = True

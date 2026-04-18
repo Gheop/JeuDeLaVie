@@ -86,6 +86,19 @@ To regenerate the screenshot at the top of this README:
 python3 life.py --screenshot screenshot.png
 ```
 
+To regenerate the animated demo, dump N frames and assemble them with ffmpeg:
+
+```bash
+python3 life.py --frames frames/ 240 1          # 240 PNGs, 1 sim step per frame
+ffmpeg -framerate 30 -i frames/frame_%04d.png \
+       -vf "scale=640:-1:flags=lanczos" demo.gif
+ffmpeg -framerate 30 -i frames/frame_%04d.png \
+       -c:v libx264 -pix_fmt yuv420p -crf 28 demo.mp4
+```
+
+The optional third argument (`stride`) runs several simulation steps per captured
+frame — use it to speed up long-running scenes without making the GIF huge.
+
 ## Controls
 
 | Input | Action |
