@@ -1162,27 +1162,35 @@ def main():
         stamp(PATTERNS[pygame.K_8][1], (int(0.50 * sw), int(0.78 * sh)))  # R-pent
         return sw, sh
 
-    def _render_frame(sw, sh, time_s, with_help):
-        ensure_glow_tex(sw, sh)
-        # passe H du glow (écrit dans glow["tex"])
+    def render_world(w, h, center, zoom, time_s):
+        """Rend la simulation à l'écran pour la fenêtre `(w, h)` à la vue
+        `(center, zoom)`. Exécute les deux passes habituelles : H du glow
+        dans glow["fbo"], puis composition finale (passe V + cellules +
+        fond + vignette + dither) sur ctx.screen. Ne touche pas le HUD ni
+        la preview — c'est au caller d'ajouter ces couches par-dessus."""
+        ensure_glow_tex(w, h)
         glow["fbo"].use()
-        ctx.viewport = (0, 0, sw, sh)
+        ctx.viewport = (0, 0, w, h)
         chunk.front_tex.use(0)
         glow_h_prog["u_state"]  = 0
-        glow_h_prog["u_center"] = (0.5, 0.5)
-        glow_h_prog["u_zoom"]   = 1.0
+        glow_h_prog["u_center"] = center
+        glow_h_prog["u_zoom"]   = zoom
         glow_h_vao.render(moderngl.TRIANGLE_STRIP)
-        # composition finale (passe V du glow + cellules + fond)
         ctx.screen.use()
-        ctx.viewport = (0, 0, sw, sh)
+        ctx.viewport = (0, 0, w, h)
         chunk.front_tex.use(0)
         glow["tex"].use(1)
         display_prog["u_state"]  = 0
         display_prog["u_glow_h"] = 1
         display_prog["u_time"]   = time_s
-        display_prog["u_center"] = (0.5, 0.5)
-        display_prog["u_zoom"]   = 1.0
+        display_prog["u_center"] = center
+        display_prog["u_zoom"]   = zoom
         display_vao.render(moderngl.TRIANGLE_STRIP)
+
+    def _render_frame(sw, sh, time_s, with_help):
+        """Rendu "capture" : vue fixe centrée (utilisé par --screenshot / --frames).
+        Dessine le monde puis le HUD de statut + l'aide si demandée."""
+        render_world(sw, sh, (0.5, 0.5), 1.0, time_s)
         rule_name = RULES[sim["rule_idx"]][0]
         status = (f"Gen {counters['gen']:>6}  ·  {counters['alive']:>5} vivantes  "
                   f"·  {tps:>3} TPS  ·  {rule_name}  ·  PLAY")
@@ -1529,29 +1537,9 @@ def main():
 
         # ── rendu écran ─────────────────────────────────────────
         w, h = pygame.display.get_surface().get_size()
-        ensure_glow_tex(w, h)
-
-        # 0) passe H du glow (R8, résolution écran)
-        glow["fbo"].use()
-        ctx.viewport = (0, 0, w, h)
-        chunk.front_tex.use(0)
-        glow_h_prog["u_state"]  = 0
-        glow_h_prog["u_center"] = (view["cx"], view["cy"])
-        glow_h_prog["u_zoom"]   = view["zoom"]
-        glow_h_vao.render(moderngl.TRIANGLE_STRIP)
-
-        ctx.screen.use()
-        ctx.viewport = (0, 0, w, h)
-
-        # 1) composition finale (passe V + cellules + fond + vignette + dither)
-        chunk.front_tex.use(0)
-        glow["tex"].use(1)
-        display_prog["u_state"]  = 0
-        display_prog["u_glow_h"] = 1
-        display_prog["u_time"]   = pygame.time.get_ticks() / 1000.0 - t0
-        display_prog["u_center"] = (view["cx"], view["cy"])
-        display_prog["u_zoom"]   = view["zoom"]
-        display_vao.render(moderngl.TRIANGLE_STRIP)
+        render_world(w, h,
+                     (view["cx"], view["cy"]), view["zoom"],
+                     pygame.time.get_ticks() / 1000.0 - t0)
 
         # 2) preview du motif en cours de placement
         if place["pattern"] is not None and pattern_tex["tex"] is not None:
