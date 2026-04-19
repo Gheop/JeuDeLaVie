@@ -32,7 +32,12 @@ import moderngl
 
 
 WIN_W, WIN_H = 1280, 800
-GRID_W, GRID_H = 8192, 5120        # résolution de la simulation
+# La grille est allouée à la résolution de l'écran au démarrage et double
+# (en place, avec recopie centrée) à chaque fois que la vue dézoomée/pannée
+# menace de sortir de ses bords. Ça évite de payer une grille 42 Mpixel
+# quand l'utilisateur n'en utilise qu'un coin, tout en conservant l'illusion
+# d'un monde qui s'agrandit quand on recule la caméra.
+MAX_GRID_SIZE = 16384              # borne haute (limite texture GPU usuelle)
 INITIAL_TPS = 30                    # ticks de simulation par seconde
 
 
@@ -252,6 +257,25 @@ void main() {
 }
 """
 
+# Agrandissement de la grille : on alloue une texture 2× plus grande et on
+# recopie l'ancien contenu au centre (bande 0.25..0.75 de la nouvelle texture).
+# Tout ce qui déborde (les anciens bords) reste à 0, donc du monde "vide".
+GROW_SHADER = """
+#version 330
+uniform sampler2D u_src;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    // v_uv couvre la nouvelle texture ; on remappe [0.25, 0.75] -> [0, 1].
+    vec2 uv = (v_uv - 0.25) * 2.0;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        frag = vec4(0.0);
+    } else {
+        frag = texture(u_src, uv);
+    }
+}
+"""
+
 # Surcouche HUD : un quad (x, y, w, h) en pixels écran texturé d'une surface
 # pygame contenant le texte rendu côté CPU.
 HUD_SHADER = """
@@ -451,6 +475,7 @@ def main():
     glow_h_prog  = make_program(ctx, GLOW_H_SHADER)
     display_prog = make_program(ctx, DISPLAY_SHADER)
     preview_prog = make_program(ctx, PREVIEW_SHADER)
+    grow_prog    = make_program(ctx, GROW_SHADER)
     hud_prog     = make_program(ctx, HUD_SHADER)
 
     sim_vao     = ctx.simple_vertex_array(sim_prog,     quad, "in_pos")
@@ -460,11 +485,15 @@ def main():
     glow_h_vao  = ctx.simple_vertex_array(glow_h_prog,  quad, "in_pos")
     display_vao = ctx.simple_vertex_array(display_prog, quad, "in_pos")
     preview_vao = ctx.simple_vertex_array(preview_prog, quad, "in_pos")
+    grow_vao    = ctx.simple_vertex_array(grow_prog,    quad, "in_pos")
     hud_vao     = ctx.simple_vertex_array(hud_prog,     quad, "in_pos")
 
-    # Pour l'instant : un unique chunk qui couvre toute la grille, instancié
-    # avec un bruit initial. Prochaine étape : plusieurs chunks indexés par (cx, cy).
-    chunk = Chunk(ctx, GRID_W, GRID_H, initial=random_state(GRID_W, GRID_H))
+    # Taille initiale de la grille = résolution du bureau, plafonnée à
+    # MAX_GRID_SIZE. La grille doublera au besoin (voir grow_chunk plus bas).
+    info = pygame.display.Info()
+    init_w = max(WIN_W, min(info.current_w, MAX_GRID_SIZE))
+    init_h = max(WIN_H, min(info.current_h, MAX_GRID_SIZE))
+    chunk = Chunk(ctx, init_w, init_h, initial=random_state(init_w, init_h))
 
     # Passe H du glow : texture R8 à la résolution écran, recréée à la volée
     # quand la taille change.
@@ -532,11 +561,18 @@ def main():
         "cx": 0.5,  "cy": 0.5,  "zoom": 1.0,
         "tcx": 0.5, "tcy": 0.5, "tzoom": 1.0,
     }
-    # ZOOM_MAX légèrement > 1 : le monde est fini, dézoomer au-delà n'affiche
-    # que du vide. 1.15 laisse juste assez de marge pour voir les bords.
-    # ZOOM_MIN très petit : avec une grille de 8192×5120, il faut un fort zoom
-    # pour retrouver des cellules lisibles à l'écran (≈ 30 px/cellule).
-    ZOOM_MIN, ZOOM_MAX = 0.005, 1.15
+    # ZOOM_MAX est très permissif : c'est grow_chunk qui gère le dézoom en
+    # agrandissant la grille. On garde un plafond lointain juste pour éviter
+    # un cycle infini en cas de saturation de la taille max.
+    # ZOOM_MIN est dérivé de la grille courante (≈ 30 cellules visibles mini)
+    # et remis à jour après chaque agrandissement.
+    ZOOM_MAX = 4.0
+    MIN_CELLS_VISIBLE = 30.0
+    zoom_min = {"value": MIN_CELLS_VISIBLE / chunk.width}
+
+    def update_zoom_min():
+        zoom_min["value"] = MIN_CELLS_VISIBLE / chunk.width
+
     LERP_SPEED = 18.0  # plus grand = plus snappy
 
     def screen_uv(pos):
@@ -556,7 +592,7 @@ def main():
         sx, sy = screen_uv(pos)
         tx = (sx - 0.5) * view["tzoom"] + view["tcx"]
         ty = (sy - 0.5) * view["tzoom"] + view["tcy"]
-        view["tzoom"] = max(ZOOM_MIN, min(ZOOM_MAX, view["tzoom"] * factor))
+        view["tzoom"] = max(zoom_min["value"], min(ZOOM_MAX, view["tzoom"] * factor))
         view["tcx"] = tx - (sx - 0.5) * view["tzoom"]
         view["tcy"] = ty - (sy - 0.5) * view["tzoom"]
 
@@ -568,6 +604,48 @@ def main():
         lz = math.log(view["zoom"])
         lz += (math.log(view["tzoom"]) - lz) * k
         view["zoom"] = math.exp(lz)
+
+    def grow_chunk():
+        """Double la taille de la grille en conservant l'ancien contenu
+        centré dans la nouvelle, et rescale les coordonnées de la vue pour
+        qu'il n'y ait aucun saut visuel. Renvoie False si on est déjà à la
+        taille maximale."""
+        nonlocal chunk
+        new_w = chunk.width * 2
+        new_h = chunk.height * 2
+        if new_w > MAX_GRID_SIZE or new_h > MAX_GRID_SIZE:
+            return False
+        new_chunk = Chunk(ctx, new_w, new_h)
+        # Copie l'ancien front_tex au centre du nouveau front_tex.
+        new_chunk.front_fbo.use()
+        ctx.viewport = (0, 0, new_w, new_h)
+        chunk.front_tex.use(0)
+        grow_prog["u_src"] = 0
+        grow_vao.render(moderngl.TRIANGLE_STRIP)
+        # Rescale la vue : ce qui était en UV (u, v) sur l'ancienne grille est
+        # maintenant à (u/2 + 0.25, v/2 + 0.25) sur la nouvelle, et le zoom
+        # en UV est divisé par 2 puisque la grille est deux fois plus large.
+        for k in ("cx", "cy", "tcx", "tcy"):
+            view[k] = view[k] / 2.0 + 0.25
+        view["zoom"]  /= 2.0
+        view["tzoom"] /= 2.0
+        # Libère les ressources GL de l'ancien chunk.
+        for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
+                    chunk.reduce_tex, chunk.reduce_fbo):
+            obj.release()
+        chunk = new_chunk
+        update_zoom_min()
+        return True
+
+    def maybe_grow():
+        """Agrandit la grille autant de fois que nécessaire pour contenir la
+        cible de la vue. Appelé chaque frame après la saisie utilisateur."""
+        for _ in range(8):  # garde-fou absolu, ne devrait jamais boucler autant
+            half = view["tzoom"] / 2.0
+            needs = (view["tcx"] - half < 0.0 or view["tcx"] + half > 1.0
+                     or view["tcy"] - half < 0.0 or view["tcy"] + half > 1.0)
+            if not needs or not grow_chunk():
+                return
 
     def upload_pattern_tex(pat):
         """Uploade un motif 2D dans une texture R32F. L'appelant possède la texture."""
@@ -617,16 +695,16 @@ def main():
                 return None
             path = files[-1]
         surf = pygame.image.load(path)  # pas de .convert() : pas besoin de display
-        # ajuste à la taille de la grille (centré, fond noir si plus petit)
-        canvas = pygame.Surface((GRID_W, GRID_H))
+        # ajuste à la taille de la grille courante (centré, fond noir si plus petit)
+        canvas = pygame.Surface((chunk.width, chunk.height))
         canvas.fill((0, 0, 0))
         sw, sh = surf.get_size()
-        if sw > GRID_W or sh > GRID_H:
-            ratio = min(GRID_W / sw, GRID_H / sh)
+        if sw > chunk.width or sh > chunk.height:
+            ratio = min(chunk.width / sw, chunk.height / sh)
             surf = pygame.transform.smoothscale(
                 surf, (max(1, int(sw * ratio)), max(1, int(sh * ratio))))
             sw, sh = surf.get_size()
-        canvas.blit(surf, ((GRID_W - sw) // 2, (GRID_H - sh) // 2))
+        canvas.blit(surf, ((chunk.width - sw) // 2, (chunk.height - sh) // 2))
         arr = pygame.surfarray.array3d(canvas).swapaxes(0, 1)  # (H, W, 3)
         alive = (arr[..., 0] > 127).astype(np.uint8) * 255
         alive = np.flipud(alive)  # PNG y=0 en haut → buffer y=0 en bas
@@ -873,7 +951,7 @@ def main():
         ctx.finish()
         dt_count = time.perf_counter() - t0
 
-        print(f"bench N={n}  screen {sw}x{sh}  grid {GRID_W}x{GRID_H}")
+        print(f"bench N={n}  screen {sw}x{sh}  grid {chunk.width}x{chunk.height}")
         print(f"  sim    : {dt_sim*1e6/n:8.1f} us/step   ({n/dt_sim:8.0f} steps/s)")
         print(f"  render : {dt_render*1e6/n:8.1f} us/frame  ({n/dt_render:8.0f} frames/s)")
         print(f"  count  : {dt_count*1e6/n:8.1f} us/call   ({n/dt_count:8.0f} calls/s)")
@@ -1022,6 +1100,10 @@ def main():
             stroke["last"] = None
 
         update_view(dt)
+        # Si la cible de la vue sort de la grille courante, on agrandit tant
+        # qu'il le faut (jusqu'à MAX_GRID_SIZE). Les coords de vue sont
+        # rescalées au passage pour qu'il n'y ait aucun saut visible.
+        maybe_grow()
 
         if not paused:
             sim_accum += dt
@@ -1068,7 +1150,7 @@ def main():
             pattern_tex["tex"].use(0)
             preview_prog["u_pattern"]      = 0
             preview_prog["u_cursor_tex"]   = (cx_uv, cy_uv)
-            preview_prog["u_pattern_size"] = (pw / GRID_W, ph / GRID_H)
+            preview_prog["u_pattern_size"] = (pw / chunk.width, ph / chunk.height)
             preview_prog["u_view_center"]  = (view["cx"], view["cy"])
             preview_prog["u_view_zoom"]    = view["zoom"]
             preview_prog["u_time"]         = pygame.time.get_ticks() / 1000.0

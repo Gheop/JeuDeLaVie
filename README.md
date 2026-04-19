@@ -136,8 +136,11 @@ frame — use it to speed up long-running scenes without making the GIF huge.
 | 9 | Acorn (methuselah) |
 
 The world is finite: cells that reach a border die (no toroidal wrap), so
-spaceships fly off instead of reappearing on the opposite side. The default
-grid is 8192 × 5120 (≈ 42 M cells) so you have plenty of room to zoom out.
+spaceships fly off instead of reappearing on the opposite side. The grid
+starts at the current desktop resolution and doubles in place whenever
+the view would dezoom / pan past its edges, up to `MAX_GRID_SIZE` (16384
+by default — the usual GPU texture size cap). You pay simulation cost
+proportional to the grid you actually use.
 
 ## Rules
 
@@ -193,12 +196,35 @@ A few constants at the top of `life.py` are worth playing with:
 
 | Constant | Default | Effect |
 |---|---|---|
-| `GRID_W`, `GRID_H` | 8192 × 5120 | Simulation resolution (~42 M cells, ~330 MB VRAM). Drop to 2048×1280 or 1024×640 on weaker integrated GPUs. |
+| `MAX_GRID_SIZE` | 16384 | Hard cap on width/height when growing. Lower this (e.g. 8192) to keep VRAM bounded on constrained GPUs. |
 | `INITIAL_TPS` | 30 | Starting simulation rate (ticks per second). |
 | `LERP_SPEED` | 18 | Camera responsiveness. Higher = snappier, lower = lazier. |
-| `ZOOM_MIN`, `ZOOM_MAX` | 0.005, 1.15 | How far in / out you can zoom. Past 1.0 you see background around the finite world. Scale `ZOOM_MIN` with `GRID_W` to keep ~30 px per cell at max zoom-in. |
+| `MIN_CELLS_VISIBLE`, `ZOOM_MAX` | 30, 4.0 | Zoom-in floor (auto-scaled to keep ~30 cells across on screen) and zoom-out safety cap. In practice `grow_chunk` kicks in before you hit the cap, doubling the grid instead. |
 
 ## Changelog
+
+### v0.3.0 — Grid that grows on demand (2026-04-19)
+
+- The simulation grid is no longer a fixed size. It starts at the desktop
+  resolution and **doubles in place** whenever the view would dezoom or pan
+  past its edges, up to `MAX_GRID_SIZE`. Existing content is blitted into
+  the center of the new grid; camera coords are rescaled so there is no
+  visual jump.
+- Replaces the fixed 8192 × 5120 grid that was hammering the GPU with
+  ~42 M cells of simulation every tick. Sim cost is now proportional to
+  the grid you actually use.
+- `ZOOM_MAX` is now just a safety cap; the natural limit on zoom-out is
+  `MAX_GRID_SIZE`. `ZOOM_MIN` is derived from the current grid so you
+  always get ~30 cells per screen width at max zoom-in, regardless of
+  how big the world has grown.
+- `paint` / erase no longer ping-pong the whole state texture. It writes
+  in place into the front FBO with a `ctx.scissor` clamped to the brush's
+  bounding box, and the shader `discard`s outside the circle. On a big
+  grid, a single brush dab is now a few thousand pixels instead of
+  millions — continuous strokes feel fluid again.
+- Internal refactor: the two state textures, their framebuffers and the
+  reduce texture are now packaged in a `Chunk` class (groundwork for a
+  future proper chunked world if needed).
 
 ### v0.2.0 — Bigger finite world (2026-04-19)
 
