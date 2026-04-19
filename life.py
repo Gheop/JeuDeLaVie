@@ -192,9 +192,14 @@ void main() {
 }
 """
 
-# Flou gaussien : passe horizontale, 7 taps. Rend à la résolution écran dans
-# une texture R8 intermédiaire ; la passe verticale est fusionnée dans le
-# display shader. Au total 7+7=14 taps par pixel écran au lieu de 7×7=49.
+# Flou gaussien : passe horizontale, équivalent d'un 7-tap gaussien rendu
+# en 4 taps LINEAR (sampling entre deux texels pour capter la somme pondérée
+# des deux d'un seul coup). Nécessite un sampler LINEAR sur u_state (bind
+# d'un objet Sampler distinct côté CPU — cf. glow_sampler).
+# Weights 7-tap gaussian exp(-dx²/6), dx ∈ [-3..3] :
+#   w0 = 1.0000, w±1 = 0.8465, w±2 = 0.5134, w±3 = 0.2231, Σ = 4.166.
+# Paires et offsets linear : (-3,-2)@-2.303 w0.7365, (-1,0)@-0.458 w1.8465,
+# (+1,+2)@+1.378 w1.3599, (+3)@+3.0 w0.2231.
 GLOW_H_SHADER = """
 #version 330
 uniform sampler2D u_state;
@@ -203,20 +208,22 @@ uniform float u_zoom;
 in vec2 v_uv;
 out vec4 frag;
 
+const float G_INV_SUM = 1.0 / 4.166;
+
+float sample_g(vec2 uv) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+    return texture(u_state, uv).g;
+}
+
 void main() {
     vec2 uv = (v_uv - 0.5) * u_zoom + u_center;
     float pxx = u_zoom / float(textureSize(u_state, 0).x);
-    float acc = 0.0, wsum = 0.0;
-    for (int dx = -3; dx <= 3; dx++) {
-        float w = exp(-float(dx*dx) / 6.0);
-        vec2 nb = uv + vec2(float(dx) * pxx, 0.0);
-        // Hors grille = 0 pour éviter que le glow ne tile avec la texture.
-        float g = (nb.x < 0.0 || nb.x > 1.0 || nb.y < 0.0 || nb.y > 1.0)
-                  ? 0.0 : texture(u_state, nb).g;
-        acc  += g * w;
-        wsum += w;
-    }
-    frag = vec4(acc / wsum, 0.0, 0.0, 1.0);
+    float g = 0.0;
+    g += sample_g(uv + vec2(-2.303 * pxx, 0.0)) * 0.7365;
+    g += sample_g(uv + vec2(-0.458 * pxx, 0.0)) * 1.8465;
+    g += sample_g(uv + vec2( 1.378 * pxx, 0.0)) * 1.3599;
+    g += sample_g(uv + vec2( 3.000 * pxx, 0.0)) * 0.2231;
+    frag = vec4(g * G_INV_SUM, 0.0, 0.0, 1.0);
 }
 """
 
@@ -243,14 +250,17 @@ void main() {
     bool in_grid = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
     vec4 s  = in_grid ? texture(u_state, uv) : vec4(0.0);
 
+    // Passe V du flou séparable : 4 linear taps qui totalisent l'équivalent
+    // d'un 7-tap gaussien (cf. GLOW_H_SHADER pour les offsets/poids).
+    // glow_h est déjà en filtre LINEAR, donc la somme pondérée de deux taps
+    // voisins est capturée en un seul fetch entre les deux texels.
     float pxy = u_zoom / float(textureSize(u_state, 0).y);
-    float glow = 0.0, wsum = 0.0;
-    for (int dy = -3; dy <= 3; dy++) {
-        float w = exp(-float(dy*dy) / 6.0);
-        glow += texture(u_glow_h, v_uv + vec2(0.0, float(dy) * pxy)).r * w;
-        wsum += w;
-    }
-    glow /= wsum;
+    float glow = 0.0;
+    glow += texture(u_glow_h, v_uv + vec2(0.0, -2.303 * pxy)).r * 0.7365;
+    glow += texture(u_glow_h, v_uv + vec2(0.0, -0.458 * pxy)).r * 1.8465;
+    glow += texture(u_glow_h, v_uv + vec2(0.0,  1.378 * pxy)).r * 1.3599;
+    glow += texture(u_glow_h, v_uv + vec2(0.0,  3.000 * pxy)).r * 0.2231;
+    glow /= 4.166;
 
     float age   = s.g;
     float alive = s.r;
@@ -580,6 +590,13 @@ def main():
     grow_vao    = ctx.simple_vertex_array(grow_prog,    quad, "in_pos")
     shrink_vao  = ctx.simple_vertex_array(shrink_prog,  quad, "in_pos")
     hud_vao     = ctx.simple_vertex_array(hud_prog,     quad, "in_pos")
+
+    # Sampler LINEAR utilisé uniquement pendant la passe glow_h pour sampler
+    # u_state avec filtrage bilinéaire (le "linear tap" d'un flou gaussien
+    # séparable demande de blender deux texels voisins en un seul fetch).
+    # Le reste du temps, u_state reste en NEAREST (via son filtre propre).
+    glow_sampler = ctx.sampler(filter=(moderngl.LINEAR, moderngl.LINEAR))
+    glow_sampler.repeat_x = glow_sampler.repeat_y = False
 
     # Taille initiale de la grille = résolution du bureau, plafonnée à
     # MAX_GRID_SIZE. La grille doublera au besoin (voir grow_chunk plus bas).
@@ -1031,6 +1048,7 @@ def main():
     def cleanup():
         """Libère toutes les ressources GL avant pygame.quit(). Appelé depuis
         les 4 sorties possibles (--screenshot / --bench / --frames / boucle)."""
+        glow_sampler.release()
         chunk.release()
         if pattern_tex["tex"] is not None:
             pattern_tex["tex"].release()
@@ -1196,10 +1214,14 @@ def main():
         glow["fbo"].use()
         ctx.viewport = (0, 0, w, h)
         chunk.front_tex.use(0)
+        # Override temporaire avec le sampler LINEAR : glow_h a besoin de
+        # bilinear sampling sur u_state pour fusionner 2 texels en 1 tap.
+        glow_sampler.use(0)
         glow_h_prog["u_state"]  = 0
         glow_h_prog["u_center"] = center
         glow_h_prog["u_zoom"]   = zoom
         glow_h_vao.render(moderngl.TRIANGLE_STRIP)
+        glow_sampler.clear(0)
         ctx.screen.use()
         ctx.viewport = (0, 0, w, h)
         chunk.front_tex.use(0)
