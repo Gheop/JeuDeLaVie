@@ -203,6 +203,70 @@ A few constants at the top of `life.py` are worth playing with:
 
 ## Changelog
 
+### v0.4.0 — Audit pass + perf sprint + stamp fix (2026-04-19)
+
+New `--test` mode runs a headless battery of invariants (glider stays
+at 5 cells, pulsar at 48 through period-3, grow/shrink preserve exact
+counts, reduce_scale∈{1,2,4} all accurate, etc.) so every subsequent
+refactor is validated without a human in the loop. Used as the safety
+net for the changes below. New `--bench --grid N` flag to characterise
+scaling on oversized grids.
+
+Perf (vs start of v0.3 at 1280 × 800):
+
+| Measurement | Before | After | Speedup |
+|---|---|---|---|
+| Sim step    | ~450 µs  | ~370 µs | 1.2× |
+| Render frame | ~1020 µs | ~490 µs | **2.1×** |
+| Alive count  | ~1500 µs | ~880 µs (+ hidden in vsync) | **1.7×** |
+
+- **Glow 7-tap NEAREST → 4-tap LINEAR** (separable blur trick): a
+  symmetric gaussian in one axis becomes ⌈N/2⌉ fetches when the filter
+  is LINEAR, by sampling between two texels at a carefully-chosen
+  fractional offset with the combined weight. Dedicated `glow_sampler`
+  (LINEAR) overrides the state texture filter only during the glow-H
+  pass; sim keeps NEAREST. Saves 3 fetches per pixel per pass (×2
+  passes) → −21 % on render.
+- **HUD draw cache** — `draw_hud_surface` skips `tobytes()` and
+  `tex.write()` when the cached `pygame.Surface` is the same object as
+  last frame. Combined with `make_panel` returning the cached surface
+  for stable text, the per-frame HUD upload becomes a one-time cost.
+- **alive-count and sim-bbox share one mipmap readback** — used to
+  hit the GPU twice per refresh; now a single `tex.read(level=5)` of
+  the `reduce_tex` mipmap gives both the total count (sum of texels ×
+  cells-per-texel) and the active bbox (positions of non-zero texels).
+  Reading at level 5 (instead of max) also works around a Mesa
+  precision quirk where `glGenerateMipmap` on R32F drops to exactly 0
+  past level ~5 for sparse grids — sparse populations now count
+  correctly. Moved after `display.flip()` so the readback stall
+  overlaps with vsync wait.
+- **`reduce_tex` capped at 4096²** with a scale-aware reduce shader.
+  On a 16 k × 10 k grid the reduce texture alone would have been ~1 GB;
+  now it's 64 MB max, with the shader box-filtering state via `u_scale`
+  taps (specialised branches for scale ∈ {1, 2, 4}) so nothing is
+  missed.
+- **`sim` shader unrolled** with `textureOffset(ivec2)` instead of
+  `texture(v_uv + vec2(dx, dy) * px)` + explicit per-axis boundary
+  masks. Lets the GL driver emit hardware-offset fetches and makes the
+  shader easier to read.
+- **Stamp bug fix** — the shader's `p <= 1.0` inclusive bound caused a
+  3×3 pattern to land on a 4×4 region of state pixels, aliasing the
+  rightmost/topmost pattern column to two cells. On fullscreen a
+  glider showed 4 cells in a row instead of the proper 5-cell
+  spaceship, and evolved into junk. `STAMP_SHADER` now computes the
+  pattern cell index in integer pixel space
+  (`floor(v_uv * state_size) - u_cursor_px + u_pattern_px/2`), so
+  every state pixel maps to exactly one pattern cell — no FP rounding
+  at the boundary.
+- **`Chunk.release()` factored out** of three duplicated release
+  loops. **`cleanup()` called before every `pygame.quit()`** releases
+  the active chunk, preview texture, glow FBO, HUD texture cache, all
+  VAOs, programs, and the shared quad buffer — no GPU resources
+  leaked on any exit path.
+- Misc: `C` also resets `counters["gen"]`, `ctx.blend_func` set once
+  at init, unused `screen` assignment dropped, stale comments updated,
+  stamp off-by-one fix validated by `--test`.
+
 ### v0.3.0 — Grid that grows on demand (2026-04-19)
 
 - The simulation grid is no longer a fixed size. It starts at the desktop
