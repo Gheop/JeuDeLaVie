@@ -1589,7 +1589,9 @@ def main():
                 sim_accum -= step_dt
                 steps_n += 1
 
-        update_alive_count()
+        # update_alive_count fait un GPU readback bloquant ; on le déplace
+        # APRÈS display.flip() plus bas pour que le stall ait lieu pendant
+        # l'attente vsync, masquant son coût dans le budget frame.
 
         # ── rendu écran ─────────────────────────────────────────
         w, h = pygame.display.get_surface().get_size()
@@ -1637,6 +1639,10 @@ def main():
                 (0, 60), anchor="topcenter", label="flash")
 
         pygame.display.flip()
+        # Après flip : le GPU a fini de dessiner (ou est en vsync). Le
+        # readback de reduce_tex stall "gratuitement" maintenant, alors
+        # qu'avant flip il bouffait du budget de frame.
+        update_alive_count()
 
         if pygame.time.get_ticks() % 500 < 17:
             pygame.display.set_caption(
