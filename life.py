@@ -417,9 +417,7 @@ def make_program(ctx, fragment):
 
 class Chunk:
     """Rectangle de monde autonome : textures ping-pong pour la sim et une
-    texture de réduction pour compter les vivantes. Posé ici en prévision
-    d'un monde chunked (étapes 2 et 3). Pour le moment on en instancie un
-    seul qui couvre la totalité de la grille."""
+    texture de réduction pour compter les vivantes (et détecter la bbox active)."""
 
     def __init__(self, ctx, width, height, initial=None):
         self.width = width
@@ -452,6 +450,13 @@ class Chunk:
         self.front_tex, self.back_tex = self.back_tex, self.front_tex
         self.front_fbo, self.back_fbo = self.back_fbo, self.front_fbo
 
+    def release(self):
+        """Libère toutes les ressources GL détenues. Appelé sur les vieux
+        chunks après grow/shrink, et sur l'unique chunk restant au shutdown."""
+        for obj in (self.fbo_a, self.fbo_b, self.tex_a, self.tex_b,
+                    self.reduce_fbo, self.reduce_tex):
+            obj.release()
+
     def clear(self):
         zeros = np.zeros((self.height, self.width, 2), dtype=np.uint8)
         self.front_tex.write(zeros.tobytes())
@@ -483,12 +488,16 @@ def main():
     start_windowed = "--windowed" in sys.argv
     fullscreen = not start_windowed
     if fullscreen:
-        screen = pygame.display.set_mode((0, 0), fullscreen_flags)
+        pygame.display.set_mode((0, 0), fullscreen_flags)
     else:
-        screen = pygame.display.set_mode((WIN_W, WIN_H), windowed_flags)
+        pygame.display.set_mode((WIN_W, WIN_H), windowed_flags)
 
     ctx = moderngl.create_context()
     ctx.enable(moderngl.BLEND)
+    # Défini une fois : le seul blend func utilisé est le alpha over classique
+    # (pour le HUD et la preview du motif). La sim et le display opaque sont
+    # en write-only, le blend actif ne les gêne pas.
+    ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
     # quad plein écran
     quad = ctx.buffer(np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4").tobytes())
@@ -580,8 +589,8 @@ def main():
     def paint(uv, radius=0.012, value=1.0):
         # Écriture en place : on cible directement front_fbo et on scissor le
         # rectangle englobant le pinceau pour que le GPU ne rastérise que là.
-        # Sur une grille 8192×5120, ça fait passer un paint de 42M pixels
-        # à quelques milliers, soit un gain de l'ordre de 10 000× à faible zoom.
+        # Gain considérable sur grandes grilles : au lieu de passer sur toute
+        # la grille à chaque dab, on ne touche que le carré autour du pinceau.
         r_cells = radius * chunk.height
         cx_cells = uv[0] * chunk.width
         cy_cells = uv[1] * chunk.height
@@ -611,6 +620,7 @@ def main():
 
     def clear_grid():
         chunk.clear()
+        counters["gen"]      = 0
         counters["alive"]    = 0
         counters["alive_at"] = pygame.time.get_ticks()
         sim_bbox["valid"]    = False
@@ -619,6 +629,7 @@ def main():
         chunk.randomize()
         # Estimation provisoire en attendant le reduce mipmap ; max(1, ...)
         # suffirait mais on donne une valeur plausible pour le HUD.
+        counters["gen"]      = 0
         counters["alive"]    = int(0.25 * chunk.width * chunk.height)
         counters["alive_at"] = 0
         sim_bbox["valid"]    = False
@@ -629,9 +640,7 @@ def main():
         les FPS nominaux même après avoir dézoomé à fond."""
         nonlocal chunk
         if chunk.width != init_w or chunk.height != init_h:
-            for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
-                        chunk.reduce_tex, chunk.reduce_fbo):
-                obj.release()
+            chunk.release()
             chunk = Chunk(ctx, init_w, init_h)
             update_zoom_min()
         else:
@@ -640,6 +649,7 @@ def main():
             view[k] = 0.5
         view["zoom"]  = 1.0
         view["tzoom"] = 1.0
+        counters["gen"]      = 0
         counters["alive"]    = 0
         counters["alive_at"] = pygame.time.get_ticks()
         sim_bbox["valid"]    = False
@@ -729,9 +739,7 @@ def main():
             sim_bbox["y0"] += off_y
             sim_bbox["y1"] += off_y
         # Libère les ressources GL de l'ancien chunk.
-        for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
-                    chunk.reduce_tex, chunk.reduce_fbo):
-            obj.release()
+        chunk.release()
         chunk = new_chunk
         update_zoom_min()
         return True
@@ -773,9 +781,7 @@ def main():
             sim_bbox["y0"] = max(0, sim_bbox["y0"] - off_y)
             sim_bbox["x1"] = min(new_w, sim_bbox["x1"] - off_x)
             sim_bbox["y1"] = min(new_h, sim_bbox["y1"] - off_y)
-        for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
-                    chunk.reduce_tex, chunk.reduce_fbo):
-            obj.release()
+        chunk.release()
         chunk = new_chunk
         update_zoom_min()
 
@@ -955,6 +961,37 @@ def main():
     # de taille ; sinon .write() écrase le contenu.
     hud_textures = {}
 
+    # Cache du panel HUD : {label: (texte, surface_pygame)}. Le texte du status
+    # (FPS, gen, alive) ne change que ~une fois par frame à cause des FPS, mais
+    # `make_panel` reste coûteux (font.render + alloc Surface). On évite les
+    # re-rendus redondants quand rien n'a bougé côté texte.
+    panel_cache = {}
+
+    def cleanup():
+        """Libère toutes les ressources GL avant pygame.quit(). Appelé depuis
+        les 4 sorties possibles (--screenshot / --bench / --frames / boucle)."""
+        chunk.release()
+        if pattern_tex["tex"] is not None:
+            pattern_tex["tex"].release()
+            pattern_tex["tex"] = None
+        if glow["tex"] is not None:
+            glow["tex"].release()
+            glow["fbo"].release()
+            glow["tex"] = glow["fbo"] = None
+        for tex, _ in hud_textures.values():
+            tex.release()
+        hud_textures.clear()
+        panel_cache.clear()
+        for vao in (sim_vao, paint_vao, stamp_vao, reduce_vao,
+                    glow_h_vao, display_vao, preview_vao,
+                    grow_vao, shrink_vao, hud_vao):
+            vao.release()
+        for prog in (sim_prog, paint_prog, stamp_prog, reduce_prog,
+                     glow_h_prog, display_prog, preview_prog,
+                     grow_prog, shrink_prog, hud_prog):
+            prog.release()
+        quad.release()
+
     def draw_hud_surface(surf, pos, anchor="topleft", label="default"):
         w, h = surf.get_size()
         sw, sh = pygame.display.get_surface().get_size()
@@ -982,9 +1019,15 @@ def main():
         hud_vao.render(moderngl.TRIANGLE_STRIP)
 
     def make_panel(lines, font, padding=(10, 8), bg=(10, 12, 22, 165),
-                   fg=(235, 235, 245)):
+                   fg=(235, 235, 245), cache_key=None):
         if isinstance(lines, str):
             lines = lines.split("\n")
+        # Cache par clé : si le texte et la police sont identiques à l'appel
+        # précédent, on réutilise la Surface (évite font.render + alloc).
+        if cache_key is not None:
+            cached = panel_cache.get(cache_key)
+            if cached is not None and cached[0] == (tuple(lines), id(font)):
+                return cached[1]
         surfs = [font.render(line, True, fg) for line in lines]
         lw = max(s.get_width() for s in surfs) if surfs else 1
         lh = sum(s.get_height() for s in surfs) if surfs else 1
@@ -998,6 +1041,8 @@ def main():
         for s in surfs:
             panel.blit(s, (padding[0], y))
             y += s.get_height()
+        if cache_key is not None:
+            panel_cache[cache_key] = ((tuple(lines), id(font)), panel)
         return panel
 
     def update_alive_count():
@@ -1083,7 +1128,6 @@ def main():
         # composition finale (passe V du glow + cellules + fond)
         ctx.screen.use()
         ctx.viewport = (0, 0, sw, sh)
-        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         chunk.front_tex.use(0)
         glow["tex"].use(1)
         display_prog["u_state"]  = 0
@@ -1095,11 +1139,11 @@ def main():
         rule_name = RULES[sim["rule_idx"]][0]
         status = (f"Gen {counters['gen']:>6}  ·  {counters['alive']:>5} vivantes  "
                   f"·  {tps:>3} TPS  ·  {rule_name}  ·  PLAY")
-        draw_hud_surface(make_panel(status, font_main), (12, 12),
-                         anchor="bottomleft", label="status")
+        draw_hud_surface(make_panel(status, font_main, cache_key="status"),
+                         (12, 12), anchor="bottomleft", label="status")
         if with_help:
-            draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
-                             anchor="topright", label="help")
+            draw_hud_surface(make_panel(HELP_TEXT, font_help, cache_key="help"),
+                             (12, 12), anchor="topright", label="help")
 
     def _save_screen_png(sw, sh, path):
         data = ctx.screen.read(components=3, dtype="f1")
@@ -1117,6 +1161,7 @@ def main():
         update_alive_count()
         _render_frame(sw, sh, time_s=1.5, with_help=True)
         _save_screen_png(sw, sh, out_path)
+        cleanup()
         pygame.quit()
         print(f"Capture : {out_path}")
         return
@@ -1158,6 +1203,7 @@ def main():
         print(f"  sim    : {dt_sim*1e6/n:8.1f} us/step   ({n/dt_sim:8.0f} steps/s)")
         print(f"  render : {dt_render*1e6/n:8.1f} us/frame  ({n/dt_render:8.0f} frames/s)")
         print(f"  count  : {dt_count*1e6/n:8.1f} us/call   ({n/dt_count:8.0f} calls/s)")
+        cleanup()
         pygame.quit()
         return
 
@@ -1176,6 +1222,7 @@ def main():
                 update_alive_count()
             _render_frame(sw, sh, time_s=f * 0.04, with_help=False)
             _save_screen_png(sw, sh, os.path.join(out_dir, f"frame_{f:04d}.png"))
+        cleanup()
         pygame.quit()
         print(f"Capture : {n_frames} frames → {out_dir}")
         return
@@ -1198,12 +1245,10 @@ def main():
                     paused = not paused
                 elif e.key == pygame.K_r:
                     randomize()
-                    counters["gen"] = 0
                 elif e.key == pygame.K_c:
                     # Nettoie ET rétrécit la grille à la taille initiale : plus
                     # de grille géante qui pèse sur les FPS après un dézoom.
                     reset_world()
-                    counters["gen"] = 0
                 elif e.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     tps = min(240, tps + 5)
                 elif e.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -1338,7 +1383,6 @@ def main():
 
         ctx.screen.use()
         ctx.viewport = (0, 0, w, h)
-        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
         # 1) composition finale (passe V + cellules + fond + vignette + dither)
         chunk.front_tex.use(0)
@@ -1368,23 +1412,25 @@ def main():
         status = (f"Gen {counters['gen']:>6}  ·  {counters['alive']:>5} vivantes  "
                   f"·  {clock.get_fps():3.0f} FPS  ·  {tps:>3} TPS  "
                   f"·  {rule_name}  ·  {'PAUSE' if paused else 'PLAY'}")
-        draw_hud_surface(make_panel(status, font_main), (12, 12),
-                         anchor="bottomleft", label="status")
+        draw_hud_surface(make_panel(status, font_main, cache_key="status"),
+                         (12, 12), anchor="bottomleft", label="status")
 
         if show_help:
-            draw_hud_surface(make_panel(HELP_TEXT, font_help), (12, 12),
-                             anchor="topright", label="help")
+            draw_hud_surface(make_panel(HELP_TEXT, font_help, cache_key="help"),
+                             (12, 12), anchor="topright", label="help")
 
         if place["pattern"] is not None:
             label = f"▸ {place['name']}   Q/E rotation · clic gauche : pose · Esc : annule"
             draw_hud_surface(
-                make_panel(label, font_main, bg=(120, 80, 20, 200)),
+                make_panel(label, font_main, bg=(120, 80, 20, 200),
+                           cache_key="placement"),
                 (0, 12), anchor="topcenter", label="placement")
 
         if pygame.time.get_ticks() < flash["until"]:
             draw_hud_surface(
                 make_panel(flash["text"], font_big, padding=(18, 14),
-                           bg=(20, 25, 50, 200), fg=(255, 240, 200)),
+                           bg=(20, 25, 50, 200), fg=(255, 240, 200),
+                           cache_key="flash"),
                 (0, 60), anchor="topcenter", label="flash")
 
         pygame.display.flip()
@@ -1395,6 +1441,7 @@ def main():
                 f"{'PAUSE' if paused else 'PLAY'}"
             )
 
+    cleanup()
     pygame.quit()
 
 
