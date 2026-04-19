@@ -32,7 +32,7 @@ import moderngl
 
 
 WIN_W, WIN_H = 1280, 800
-GRID_W, GRID_H = 2048, 1280        # résolution de la simulation
+GRID_W, GRID_H = 8192, 5120        # résolution de la simulation
 INITIAL_TPS = 30                    # ticks de simulation par seconde
 
 
@@ -504,7 +504,9 @@ def main():
     }
     # ZOOM_MAX légèrement > 1 : le monde est fini, dézoomer au-delà n'affiche
     # que du vide. 1.15 laisse juste assez de marge pour voir les bords.
-    ZOOM_MIN, ZOOM_MAX = 0.02, 1.15
+    # ZOOM_MIN très petit : avec une grille de 8192×5120, il faut un fort zoom
+    # pour retrouver des cellules lisibles à l'écran (≈ 30 px/cellule).
+    ZOOM_MIN, ZOOM_MAX = 0.005, 1.15
     LERP_SPEED = 18.0  # plus grand = plus snappy
 
     def screen_uv(pos):

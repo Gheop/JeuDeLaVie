@@ -137,7 +137,7 @@ frame — use it to speed up long-running scenes without making the GIF huge.
 
 The world is finite: cells that reach a border die (no toroidal wrap), so
 spaceships fly off instead of reappearing on the opposite side. The default
-grid is 2048 × 1280 so you have plenty of room to zoom out.
+grid is 8192 × 5120 (≈ 42 M cells) so you have plenty of room to zoom out.
 
 ## Rules
 
@@ -193,10 +193,10 @@ A few constants at the top of `life.py` are worth playing with:
 
 | Constant | Default | Effect |
 |---|---|---|
-| `GRID_W`, `GRID_H` | 2048 × 1280 | Simulation resolution. Drop to 1024×640 on weaker integrated GPUs. |
+| `GRID_W`, `GRID_H` | 8192 × 5120 | Simulation resolution (~42 M cells, ~330 MB VRAM). Drop to 2048×1280 or 1024×640 on weaker integrated GPUs. |
 | `INITIAL_TPS` | 30 | Starting simulation rate (ticks per second). |
 | `LERP_SPEED` | 18 | Camera responsiveness. Higher = snappier, lower = lazier. |
-| `ZOOM_MIN`, `ZOOM_MAX` | 0.02, 1.15 | How far in / out you can zoom. Past 1.0 you start seeing background around the finite world. |
+| `ZOOM_MIN`, `ZOOM_MAX` | 0.005, 1.15 | How far in / out you can zoom. Past 1.0 you see background around the finite world. Scale `ZOOM_MIN` with `GRID_W` to keep ~30 px per cell at max zoom-in. |
 
 ## Changelog
 
