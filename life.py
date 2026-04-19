@@ -1394,6 +1394,17 @@ def main():
     if "--bench" in sys.argv:
         i = sys.argv.index("--bench")
         n = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 2000
+        # Option `--grid N` : force la grille à N×(N*10/16) (16:10). Permet
+        # de tester la perf à grosse taille sans attendre des grows user.
+        if "--grid" in sys.argv:
+            gi = sys.argv.index("--grid")
+            target_w = int(sys.argv[gi + 1])
+            target_h = target_w * 10 // 16
+            while chunk.width < target_w or chunk.height < target_h:
+                if not grow_chunk():
+                    break
+            print(f"bench forced grid {chunk.width}x{chunk.height} "
+                  f"(reduce_scale={chunk.reduce_scale})")
         randomize()
         sw, sh = pygame.display.get_surface().get_size()
 
