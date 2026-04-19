@@ -112,27 +112,41 @@ void main() {
 
 # Stamp d'un motif sur la grille, entièrement GPU (évite un aller-retour
 # lecture/écriture numpy). Le motif est uploadé dans u_pattern ; on sample
-# l'état d'entrée puis on écrase là où le motif est à 1. Pas de wrap : un
-# motif posé près d'un bord est clippé (cohérent avec la sim finie).
+# l'état d'entrée puis on écrase là où le motif est à 1.
+# Pas de wrap : un motif posé près d'un bord est clippé. On calcule l'indice
+# de cellule motif avec un floor explicite (et non un sample NEAREST avec
+# bornes inclusives) pour que la zone de pose fasse EXACTEMENT W×H cellules,
+# sans aliaser la colonne/ligne de bordure — sinon un glider 3×3 se pose sur
+# 4×4 pixels et écrase la mauvaise paire (cf. tests).
 STAMP_SHADER = """
 #version 330
 uniform sampler2D u_state;
 uniform sampler2D u_pattern;
-uniform vec2 u_cursor_tex;     // centre du motif en UV de la texture d'état
-uniform vec2 u_pattern_size;   // taille du motif en UV de la texture d'état
+uniform ivec2 u_cursor_px;     // pixel central du motif sur la grille
+uniform ivec2 u_pattern_px;    // taille du motif en pixels (w, h)
 in vec2 v_uv;
 out vec4 frag;
 
 void main() {
     vec4 cur = texture(u_state, v_uv);
-    vec2 d = v_uv - u_cursor_tex;
-    vec2 p = d / u_pattern_size + 0.5;
-    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) {
-        float a = texture(u_pattern, p).r;
-        if (a > 0.5) {
-            cur.r = 1.0;
-            cur.g = max(cur.g, 1.0);
-        }
+    // Calcul en entiers pour éviter les erreurs de précision aux bornes du
+    // stamp zone : v_uv * state_size interpolé peut dévier de 1 ULP et
+    // faire rentrer/sortir un pixel de trop avec un float floor.
+    ivec2 state_px  = textureSize(u_state, 0);
+    ivec2 pixel_here = ivec2(v_uv * vec2(state_px));
+    ivec2 half_px   = u_pattern_px / 2;
+    ivec2 cell      = pixel_here - u_cursor_px + half_px;
+    if (cell.x < 0 || cell.x >= u_pattern_px.x
+        || cell.y < 0 || cell.y >= u_pattern_px.y) {
+        frag = cur;
+        return;
+    }
+    // Sample au centre de la cellule motif (évite le biais NEAREST bord).
+    vec2 puv = (vec2(cell) + 0.5) / vec2(u_pattern_px);
+    float a = texture(u_pattern, puv).r;
+    if (a > 0.5) {
+        cur.r = 1.0;
+        cur.g = max(cur.g, 1.0);
     }
     frag = cur;
 }
@@ -874,10 +888,14 @@ def main():
             ctx.viewport = (0, 0, chunk.width, chunk.height)
             chunk.front_tex.use(0)
             tex.use(1)
-            stamp_prog["u_state"]        = 0
-            stamp_prog["u_pattern"]      = 1
-            stamp_prog["u_cursor_tex"]   = (cx_uv, cy_uv)
-            stamp_prog["u_pattern_size"] = (w / chunk.width, h / chunk.height)
+            # Conversion du cursor UV -> pixel entier de la grille (évite les
+            # approximations FP aux bords du stamp zone côté GPU).
+            cx_px_i = int(cx_uv * chunk.width)
+            cy_px_i = int(cy_uv * chunk.height)
+            stamp_prog["u_state"]      = 0
+            stamp_prog["u_pattern"]    = 1
+            stamp_prog["u_cursor_px"]  = (cx_px_i, cy_px_i)
+            stamp_prog["u_pattern_px"] = (w, h)
             stamp_vao.render(moderngl.TRIANGLE_STRIP)
             chunk.swap()
             counters["alive"]    = max(1, counters["alive"])
@@ -1232,21 +1250,20 @@ def main():
         clear_grid()
         check("clear_grid: alive==0", count_alive_direct() == 0)
 
-        # 2) stamp d'un glider => cellules vivantes (le stamp a un off-by-one
-        #    connu sur très petits motifs au bord des pixels, on se contente
-        #    de "au moins 4").
+        # 2) stamp d'un glider => exactement 5 cellules vivantes (pattern
+        #    complet, shader de stamp corrigé pour ne pas aliaser les bords).
         sw, sh = pygame.display.get_surface().get_size()
         stamp(PATTERNS[pygame.K_1][1], (sw // 2, sh // 2))
         post_stamp = count_alive_direct()
-        check("glider stamp: alive>=4", post_stamp >= 4, f"got {post_stamp}")
+        check("glider stamp: alive==5", post_stamp == 5, f"got {post_stamp}")
 
-        # 3) Conway B3/S23 sur un glider : le compte reste borné (period-4
-        #    spaceship → typiquement 5 cellules, ±1 selon phase et off-by-one).
+        # 3) Conway B3/S23 sur un glider : spaceship period-4, le compte reste
+        #    exactement 5 à chaque génération.
         counters["alive"] = post_stamp or 1
         for _ in range(40):
             step()
         after_40 = count_alive_direct()
-        check("glider after 40 gens: 3<=alive<=7", 3 <= after_40 <= 7,
+        check("glider after 40 gens: alive==5", after_40 == 5,
               f"got {after_40}")
 
         # 4) grow_chunk préserve le compte vivant
@@ -1268,12 +1285,16 @@ def main():
         clear_grid()
         stamp(PATTERNS[pygame.K_5][1], (sw // 2, sh // 2))
         pulsar_initial = count_alive_direct()
-        # Tolérance large : le stamp shader a un off-by-one aux bords (condition
-        # `<=` inclusive côté p.x=1) qui ajoute une rangée/colonne de plus sur
-        # les petits motifs. Pour le pulsar (13×13, 48 cellules) on peut
-        # récolter 40–70 cellules selon l'alignement pixel du cursor.
-        check("pulsar stamp: 40<=alive<=80", 40 <= pulsar_initial <= 80,
+        check("pulsar stamp: alive==48", pulsar_initial == 48,
               f"got {pulsar_initial}")
+
+        # 6bis) Invariant period-3 du pulsar : après 3 pas, même compte.
+        counters["alive"] = pulsar_initial or 1
+        for _ in range(3):
+            step()
+        after_period = count_alive_direct()
+        check("pulsar after period-3 gens: alive==48", after_period == 48,
+              f"got {after_period}")
 
         # 7) Pulsar survit à plusieurs grows (valide la préservation du
         #    contenu sur grille multiples fois agrandie).
