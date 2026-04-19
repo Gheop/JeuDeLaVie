@@ -502,7 +502,9 @@ def main():
         "cx": 0.5,  "cy": 0.5,  "zoom": 1.0,
         "tcx": 0.5, "tcy": 0.5, "tzoom": 1.0,
     }
-    ZOOM_MIN, ZOOM_MAX = 0.02, 4.0
+    # ZOOM_MAX légèrement > 1 : le monde est fini, dézoomer au-delà n'affiche
+    # que du vide. 1.15 laisse juste assez de marge pour voir les bords.
+    ZOOM_MIN, ZOOM_MAX = 0.02, 1.15
     LERP_SPEED = 18.0  # plus grand = plus snappy
 
     def screen_uv(pos):

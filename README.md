@@ -196,7 +196,7 @@ A few constants at the top of `life.py` are worth playing with:
 | `GRID_W`, `GRID_H` | 2048 × 1280 | Simulation resolution. Drop to 1024×640 on weaker integrated GPUs. |
 | `INITIAL_TPS` | 30 | Starting simulation rate (ticks per second). |
 | `LERP_SPEED` | 18 | Camera responsiveness. Higher = snappier, lower = lazier. |
-| `ZOOM_MIN`, `ZOOM_MAX` | 0.02, 4.0 | How far in / out you can zoom. |
+| `ZOOM_MIN`, `ZOOM_MAX` | 0.02, 1.15 | How far in / out you can zoom. Past 1.0 you start seeing background around the finite world. |
 
 ## Changelog
 
