@@ -276,6 +276,23 @@ void main() {
 }
 """
 
+# Rétrécissement : ne garde que le quart central de l'ancienne texture et
+# l'étire sur la totalité de la nouvelle (2× plus petite). On ne l'appelle
+# que si on a vérifié qu'il n'y a aucune cellule vivante en dehors de cette
+# zone, donc pas de perte d'information.
+SHRINK_SHADER = """
+#version 330
+uniform sampler2D u_src;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    // v_uv couvre la nouvelle texture (plus petite) ; on échantillonne le
+    // centre [0.25, 0.75] de l'ancienne.
+    vec2 uv = v_uv * 0.5 + 0.25;
+    frag = texture(u_src, uv);
+}
+"""
+
 # Surcouche HUD : un quad (x, y, w, h) en pixels écran texturé d'une surface
 # pygame contenant le texte rendu côté CPU.
 HUD_SHADER = """
@@ -484,6 +501,7 @@ def main():
     display_prog = make_program(ctx, DISPLAY_SHADER)
     preview_prog = make_program(ctx, PREVIEW_SHADER)
     grow_prog    = make_program(ctx, GROW_SHADER)
+    shrink_prog  = make_program(ctx, SHRINK_SHADER)
     hud_prog     = make_program(ctx, HUD_SHADER)
 
     sim_vao     = ctx.simple_vertex_array(sim_prog,     quad, "in_pos")
@@ -494,6 +512,7 @@ def main():
     display_vao = ctx.simple_vertex_array(display_prog, quad, "in_pos")
     preview_vao = ctx.simple_vertex_array(preview_prog, quad, "in_pos")
     grow_vao    = ctx.simple_vertex_array(grow_prog,    quad, "in_pos")
+    shrink_vao  = ctx.simple_vertex_array(shrink_prog,  quad, "in_pos")
     hud_vao     = ctx.simple_vertex_array(hud_prog,     quad, "in_pos")
 
     # Taille initiale de la grille = résolution du bureau, plafonnée à
@@ -727,6 +746,67 @@ def main():
             if not needs or not grow_chunk():
                 return
 
+    def shrink_chunk():
+        """Divise la taille de la grille par 2 en ne gardant que le quart central.
+        L'appelant garantit que la zone abandonnée (les 3/4 périphériques) est
+        intégralement vide, donc aucune cellule vivante n'est perdue."""
+        nonlocal chunk
+        new_w = chunk.width  // 2
+        new_h = chunk.height // 2
+        new_chunk = Chunk(ctx, new_w, new_h)
+        new_chunk.front_fbo.use()
+        ctx.viewport = (0, 0, new_w, new_h)
+        chunk.front_tex.use(0)
+        shrink_prog["u_src"] = 0
+        shrink_vao.render(moderngl.TRIANGLE_STRIP)
+        # Rescale vue : inverse de grow (cx_new = 2·cx_old − 0.5, zoom ×2).
+        for k in ("cx", "cy", "tcx", "tcy"):
+            view[k] = view[k] * 2.0 - 0.5
+        view["zoom"]  *= 2.0
+        view["tzoom"] *= 2.0
+        # Décale la bbox dans les nouvelles coords (on a enlevé W/4 à gauche,
+        # H/4 en haut — les indices se décalent d'autant).
+        if sim_bbox["valid"]:
+            off_x = chunk.width  // 4
+            off_y = chunk.height // 4
+            sim_bbox["x0"] = max(0, sim_bbox["x0"] - off_x)
+            sim_bbox["y0"] = max(0, sim_bbox["y0"] - off_y)
+            sim_bbox["x1"] = min(new_w, sim_bbox["x1"] - off_x)
+            sim_bbox["y1"] = min(new_h, sim_bbox["y1"] - off_y)
+        for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
+                    chunk.reduce_tex, chunk.reduce_fbo):
+            obj.release()
+        chunk = new_chunk
+        update_zoom_min()
+
+    def maybe_shrink():
+        """Rétrécit la grille si la vie et la vue tiennent toutes deux dans
+        le quart central. Appelé au rythme d'update_alive_count (500 ms) —
+        pas besoin de plus, la vie ne rétrécit pas aussi vite."""
+        if not sim_bbox["valid"]:
+            return
+        if chunk.width <= init_w or chunk.height <= init_h:
+            return
+        # Zone qu'on garderait : le quart central en pixels.
+        qx = chunk.width  // 4
+        qy = chunk.height // 4
+        cells_in_core = (sim_bbox["x0"] >= qx
+                         and sim_bbox["y0"] >= qy
+                         and sim_bbox["x1"] <= chunk.width  - qx
+                         and sim_bbox["y1"] <= chunk.height - qy)
+        if not cells_in_core:
+            return
+        # La cible de la vue doit aussi tenir dans le quart central en UV,
+        # sinon le rescale cracherait la vue hors de la nouvelle grille.
+        half = view["tzoom"] / 2.0
+        view_in_core = (view["tcx"] - half >= 0.25
+                        and view["tcx"] + half <= 0.75
+                        and view["tcy"] - half >= 0.25
+                        and view["tcy"] + half <= 0.75)
+        if not view_in_core:
+            return
+        shrink_chunk()
+
     def upload_pattern_tex(pat):
         """Uploade un motif 2D dans une texture R32F. L'appelant possède la texture."""
         p = np.flipud(pat).astype(np.float32)
@@ -943,6 +1023,10 @@ def main():
         #    scissor le sim — évite de chauffer toute la grille quand la vie
         #    n'occupe qu'une portion du monde.
         update_sim_bbox()
+        # 5) tant qu'on est là, si la grille s'est agrandie (grow) mais que
+        #    la vie + la vue tiennent toutes deux dans le quart central, on
+        #    rétrécit : ça rend les FPS nominaux après un dezoom-puis-rezoom.
+        maybe_shrink()
 
     def update_sim_bbox():
         # Niveau grossier : chaque texel agrège ~128×128 pixels. Sur un 16k×10k
