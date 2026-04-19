@@ -522,19 +522,40 @@ def main():
 
     sim = {"rule_idx": 0}  # dict pour pouvoir muter depuis les closures
 
+    # Rectangle englobant les cellules vivantes — recalculé depuis la mipmap
+    # de reduce_tex toutes les 500 ms (cf. update_alive_count). Le sim est
+    # restreint à cette boîte + un bloc de marge, ce qui évite de simuler
+    # des dizaines de millions de cellules mortes après un grow.
+    sim_bbox = {"valid": False, "x0": 0, "y0": 0, "x1": 0, "y1": 0}
+
     def step():
-        # Rien à simuler si tout est mort : le shader Conway ne peut pas
-        # produire de la vie à partir du vide, donc on peut sauter le passe
-        # complet. Gain énorme sur une grille 16 k× après un C.
+        # Rien à simuler si tout est mort : Conway ne crée pas de vie à partir
+        # du vide, donc on peut sauter le passe complet.
         if counters["alive"] == 0:
             return
         chunk.back_fbo.use()
         ctx.viewport = (0, 0, chunk.width, chunk.height)
+        # Si on sait où est la vie, on scissor la sim et on efface d'abord
+        # tout le back_fbo pour que les pixels hors bbox restent à 0 (sinon
+        # du vieux contenu du ping-pong ressurgirait au prochain swap).
+        use_scissor = False
+        if sim_bbox["valid"]:
+            bw = sim_bbox["x1"] - sim_bbox["x0"]
+            bh = sim_bbox["y1"] - sim_bbox["y0"]
+            if bw > 0 and bh > 0 and bw * bh < chunk.width * chunk.height * 0.85:
+                use_scissor = True
+        if use_scissor:
+            ctx.scissor = None
+            chunk.back_fbo.clear()
+            ctx.scissor = (sim_bbox["x0"], sim_bbox["y0"],
+                           sim_bbox["x1"] - sim_bbox["x0"],
+                           sim_bbox["y1"] - sim_bbox["y0"])
         chunk.front_tex.use(0)
         sim_prog["u_state"]   = 0
         sim_prog["u_birth"]   = RULES[sim["rule_idx"]][1]
         sim_prog["u_survive"] = RULES[sim["rule_idx"]][2]
         sim_vao.render(moderngl.TRIANGLE_STRIP)
+        ctx.scissor = None
         chunk.swap()
 
     def paint(uv, radius=0.012, value=1.0):
@@ -565,11 +586,15 @@ def main():
         # moins une cellule, donc step() ne doit pas skipper.
         counters["alive"]    = max(1, counters["alive"]) if value > 0 else counters["alive"]
         counters["alive_at"] = 0
+        # La nouvelle zone peinte peut être hors bbox → sim la louperait.
+        # On invalide pour forcer un sim pleine-grille jusqu'au prochain update.
+        sim_bbox["valid"] = False
 
     def clear_grid():
         chunk.clear()
         counters["alive"]    = 0
         counters["alive_at"] = pygame.time.get_ticks()
+        sim_bbox["valid"]    = False
 
     def randomize():
         chunk.randomize()
@@ -577,6 +602,7 @@ def main():
         # suffirait mais on donne une valeur plausible pour le HUD.
         counters["alive"]    = int(0.25 * chunk.width * chunk.height)
         counters["alive_at"] = 0
+        sim_bbox["valid"]    = False
 
     def reset_world():
         """Rétrécit la grille à sa taille initiale et recentre la vue.
@@ -597,6 +623,7 @@ def main():
         view["tzoom"] = 1.0
         counters["alive"]    = 0
         counters["alive_at"] = pygame.time.get_ticks()
+        sim_bbox["valid"]    = False
 
     # vue : current = ce qui est affiché ; target = vers quoi on glisse.
     # cx, cy : UV du centre de la vue. zoom : largeur (en UV) visible.
@@ -654,8 +681,9 @@ def main():
         qu'il n'y ait aucun saut visuel. Renvoie False si on est déjà à la
         taille maximale."""
         nonlocal chunk
-        new_w = chunk.width * 2
-        new_h = chunk.height * 2
+        old_w, old_h = chunk.width, chunk.height
+        new_w = old_w * 2
+        new_h = old_h * 2
         if new_w > MAX_GRID_SIZE or new_h > MAX_GRID_SIZE:
             return False
         new_chunk = Chunk(ctx, new_w, new_h)
@@ -672,6 +700,15 @@ def main():
             view[k] = view[k] / 2.0 + 0.25
         view["zoom"]  /= 2.0
         view["tzoom"] /= 2.0
+        # Décale la bbox active dans les nouvelles coords (le contenu a été
+        # translaté de (old_w/2, old_h/2) en pixels).
+        if sim_bbox["valid"]:
+            off_x = old_w // 2
+            off_y = old_h // 2
+            sim_bbox["x0"] += off_x
+            sim_bbox["x1"] += off_x
+            sim_bbox["y0"] += off_y
+            sim_bbox["y1"] += off_y
         # Libère les ressources GL de l'ancien chunk.
         for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
                     chunk.reduce_tex, chunk.reduce_fbo):
@@ -716,6 +753,7 @@ def main():
             chunk.swap()
             counters["alive"]    = max(1, counters["alive"])
             counters["alive_at"] = 0
+            sim_bbox["valid"]    = False
         finally:
             tex.release()
 
@@ -759,6 +797,7 @@ def main():
         chunk.front_tex.write(buf.tobytes())
         counters["alive"]    = int((alive > 0).sum())
         counters["alive_at"] = 0
+        sim_bbox["valid"]    = False
         return path
 
     clock = pygame.time.Clock()
@@ -899,6 +938,40 @@ def main():
         fraction = float(np.frombuffer(raw, dtype=np.float32)[0])
         counters["alive"] = int(round(fraction * chunk.width * chunk.height))
         counters["alive_at"] = now
+        # 4) on en profite pour recalculer la bbox vivante à un niveau coarse
+        #    de la mipmap (un texel = ~128 cellules), utilisée par step() pour
+        #    scissor le sim — évite de chauffer toute la grille quand la vie
+        #    n'occupe qu'une portion du monde.
+        update_sim_bbox()
+
+    def update_sim_bbox():
+        # Niveau grossier : chaque texel agrège ~128×128 pixels. Sur un 16k×10k
+        # ça donne 128×80 texels = 40 KB à lire, ridicule côté coût.
+        level = min(7, chunk.reduce_max_level - 1)
+        if level < 0:
+            sim_bbox["valid"] = False
+            return
+        bw = max(1, chunk.width  >> level)
+        bh = max(1, chunk.height >> level)
+        raw = chunk.reduce_tex.read(level=level)
+        arr = np.frombuffer(raw, dtype=np.float32).reshape(bh, bw)
+        nz = arr > 1e-6
+        block = 1 << level
+        if not nz.any():
+            sim_bbox.update(valid=True, x0=0, y0=0, x1=0, y1=0)
+            return
+        ys, xs = np.where(nz)
+        x0 = int(xs.min()) * block
+        y0 = int(ys.min()) * block
+        x1 = (int(xs.max()) + 1) * block
+        y1 = (int(ys.max()) + 1) * block
+        # Marge d'un bloc pour couvrir la propagation entre 2 updates (500 ms
+        # × 30 TPS × 1 cellule/tick = 15 cellules ≤ 128 de marge, safe).
+        x0 = max(0, x0 - block)
+        y0 = max(0, y0 - block)
+        x1 = min(chunk.width,  x1 + block)
+        y1 = min(chunk.height, y1 + block)
+        sim_bbox.update(valid=True, x0=x0, y0=y0, x1=x1, y1=y1)
 
     def flash_msg(text, ms=1500):
         flash["text"] = text
