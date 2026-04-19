@@ -84,24 +84,24 @@ void main() {
 }
 """
 
-# Peinture à la souris : on écrit dans la texture d'état.
+# Peinture à la souris : on écrit directement dans la texture d'état courante
+# (pas de ping-pong) en s'appuyant sur un scissor pour limiter la rastérisation
+# au carré englobant du pinceau. Les fragments hors du cercle font `discard`,
+# ce qui préserve les pixels existants du framebuffer. Plus besoin de lire la
+# texture d'entrée : on n'écrit qu'à l'intérieur du cercle.
 PAINT_SHADER = """
 #version 330
-uniform sampler2D u_state;
 uniform vec2  u_center;     // en coordonnées UV
-uniform float u_radius;     // en UV
+uniform float u_radius;     // en UV (axe Y)
 uniform float u_value;      // 1.0 = dessine, 0.0 = efface
+uniform float u_aspect;     // width/height, pour un cercle rond en espace cellule
 in vec2 v_uv;
 out vec4 frag;
 void main() {
-    vec4 cur = texture(u_state, v_uv);
-    vec2 d = (v_uv - u_center);
-    d.x *= float(textureSize(u_state, 0).x) / float(textureSize(u_state, 0).y);
-    if (length(d) < u_radius) {
-        cur.r = u_value;
-        cur.g = max(cur.g, u_value);
-    }
-    frag = cur;
+    vec2 d = v_uv - u_center;
+    d.x *= u_aspect;
+    if (length(d) >= u_radius) discard;
+    frag = vec4(u_value, u_value, 0.0, 1.0);
 }
 """
 
@@ -496,15 +496,29 @@ def main():
         chunk.swap()
 
     def paint(uv, radius=0.012, value=1.0):
-        chunk.back_fbo.use()
+        # Écriture en place : on cible directement front_fbo et on scissor le
+        # rectangle englobant le pinceau pour que le GPU ne rastérise que là.
+        # Sur une grille 8192×5120, ça fait passer un paint de 42M pixels
+        # à quelques milliers, soit un gain de l'ordre de 10 000× à faible zoom.
+        r_cells = radius * chunk.height
+        cx_cells = uv[0] * chunk.width
+        cy_cells = uv[1] * chunk.height
+        margin = 2
+        x0 = max(0, int(cx_cells - r_cells - margin))
+        y0 = max(0, int(cy_cells - r_cells - margin))
+        x1 = min(chunk.width,  int(cx_cells + r_cells + margin) + 1)
+        y1 = min(chunk.height, int(cy_cells + r_cells + margin) + 1)
+        if x0 >= x1 or y0 >= y1:
+            return  # pinceau entièrement hors grille
+        chunk.front_fbo.use()
         ctx.viewport = (0, 0, chunk.width, chunk.height)
-        chunk.front_tex.use(0)
-        paint_prog["u_state"] = 0
+        ctx.scissor  = (x0, y0, x1 - x0, y1 - y0)
         paint_prog["u_center"] = uv
         paint_prog["u_radius"] = radius
         paint_prog["u_value"]  = value
+        paint_prog["u_aspect"] = chunk.width / chunk.height
         paint_vao.render(moderngl.TRIANGLE_STRIP)
-        chunk.swap()
+        ctx.scissor = None
 
     def clear_grid():
         chunk.clear()
