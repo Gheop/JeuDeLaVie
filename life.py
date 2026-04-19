@@ -1039,8 +1039,8 @@ def main():
             glow["tex"].release()
             glow["fbo"].release()
             glow["tex"] = glow["fbo"] = None
-        for tex, _ in hud_textures.values():
-            tex.release()
+        for entry in hud_textures.values():
+            entry[0].release()
         hud_textures.clear()
         panel_cache.clear()
         for vao in (sim_vao, paint_vao, stamp_vao, reduce_vao,
@@ -1061,17 +1061,24 @@ def main():
         elif anchor == "bottomleft": x, y = pos[0], sh - h - pos[1]
         elif anchor == "topcenter":  x, y = (sw - w) // 2, pos[1]
         else:                         x, y = pos
-        data = pygame.image.tobytes(surf, "RGBA", True)
         cached = hud_textures.get(label)
+        # hud_textures[label] = (tex, (w, h), surf_id_or_data_hash)
+        # Si la Surface est inchangée d'une frame à l'autre (cache de panel
+        # sur du texte stable), on évite le tobytes+tex.write.
+        surf_id = id(surf)
         if cached is None or cached[1] != (w, h):
             if cached is not None:
                 cached[0].release()
             tex = ctx.texture((w, h), 4)
             tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            hud_textures[label] = (tex, (w, h))
+            data = pygame.image.tobytes(surf, "RGBA", True)
+            tex.write(data)
+            hud_textures[label] = [tex, (w, h), surf_id]
         else:
             tex = cached[0]
-        tex.write(data)
+            if cached[2] != surf_id:
+                tex.write(pygame.image.tobytes(surf, "RGBA", True))
+                cached[2] = surf_id
         tex.use(0)
         hud_prog["u_hud"]       = 0
         hud_prog["u_pos_px"]    = (float(x), float(y))
