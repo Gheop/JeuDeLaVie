@@ -67,23 +67,34 @@ uniform int u_survive;
 in vec2 v_uv;
 out vec4 frag;
 
+// Déroule les 8 voisins et utilise textureOffset (offsets entiers) plutôt
+// que `texture(u_state, v_uv + vec2(dx,dy) * px)` — le compilateur GL peut
+// alors émettre des fetches avec offset en une instruction matérielle au
+// lieu de calculer nb à chaque pas. Les masques hors-grille évitent qu'une
+// cellule de bord se voit elle-même via CLAMP_TO_EDGE.
 void main() {
-    vec2 px = 1.0 / vec2(textureSize(u_state, 0));
-    float c = texture(u_state, v_uv).r;
-    int n = 0;
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            vec2 nb = v_uv + vec2(dx, dy) * px;
-            if (nb.x < 0.0 || nb.x > 1.0 || nb.y < 0.0 || nb.y > 1.0) continue;
-            n += int(texture(u_state, nb).r > 0.5);
-        }
-    }
-    int mask = (c > 0.5) ? u_survive : u_birth;
-    float alive = float((mask >> n) & 1);
+    ivec2 sz    = textureSize(u_state, 0);
+    ivec2 pxpos = ivec2(v_uv * vec2(sz));
+    vec4  self  = texture(u_state, v_uv);
 
-    float age = texture(u_state, v_uv).g;
-    age = (alive > 0.5) ? min(age + 0.04, 1.0) : age * 0.90;
+    int mxm = int(pxpos.x > 0);
+    int mxp = int(pxpos.x < sz.x - 1);
+    int mym = int(pxpos.y > 0);
+    int myp = int(pxpos.y < sz.y - 1);
+
+    int n = 0;
+    n += int(textureOffset(u_state, v_uv, ivec2(-1, -1)).r > 0.5) * mxm * mym;
+    n += int(textureOffset(u_state, v_uv, ivec2( 0, -1)).r > 0.5) * mym;
+    n += int(textureOffset(u_state, v_uv, ivec2( 1, -1)).r > 0.5) * mxp * mym;
+    n += int(textureOffset(u_state, v_uv, ivec2(-1,  0)).r > 0.5) * mxm;
+    n += int(textureOffset(u_state, v_uv, ivec2( 1,  0)).r > 0.5) * mxp;
+    n += int(textureOffset(u_state, v_uv, ivec2(-1,  1)).r > 0.5) * mxm * myp;
+    n += int(textureOffset(u_state, v_uv, ivec2( 0,  1)).r > 0.5) * myp;
+    n += int(textureOffset(u_state, v_uv, ivec2( 1,  1)).r > 0.5) * mxp * myp;
+
+    int mask = (self.r > 0.5) ? u_survive : u_birth;
+    float alive = float((mask >> n) & 1);
+    float age = (alive > 0.5) ? min(self.g + 0.04, 1.0) : self.g * 0.90;
 
     frag = vec4(alive, age, 0.0, 1.0);
 }
