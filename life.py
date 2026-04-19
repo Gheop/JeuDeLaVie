@@ -141,13 +141,40 @@ void main() {
 # Copie state.r dans une texture R32F pour la réduction mipmap
 # (moyenne → fraction de vivantes → count). Passe en float pour éviter la
 # perte de précision des formats unorm sur les petits comptages.
+# Pour éviter qu'une grille 16 k² se traduise par 1 Go de reduce_tex, on la
+# plafonne (REDUCE_MAX) et ce shader fait un box filter u_scale×u_scale
+# par pixel de sortie — branches spécialisées pour scale∈{1,2,4} afin que
+# GLSL puisse dérouler proprement.
 REDUCE_SHADER = """
 #version 330
 uniform sampler2D u_state;
+uniform int u_scale;
 in vec2 v_uv;
 out vec4 frag;
 void main() {
-    frag = vec4(texture(u_state, v_uv).r, 0.0, 0.0, 1.0);
+    if (u_scale == 1) {
+        frag = vec4(texture(u_state, v_uv).r, 0.0, 0.0, 1.0);
+        return;
+    }
+    vec2 px = 1.0 / vec2(textureSize(u_state, 0));
+    float acc = 0.0;
+    if (u_scale == 2) {
+        vec2 base = v_uv - 0.5 * px;
+        acc = texture(u_state, base).r
+            + texture(u_state, base + vec2(px.x, 0.0)).r
+            + texture(u_state, base + vec2(0.0, px.y)).r
+            + texture(u_state, base + px).r;
+        frag = vec4(acc * 0.25, 0.0, 0.0, 1.0);
+    } else {
+        // u_scale == 4 : 16 taps sur 4×4 pixels de state par pixel de sortie.
+        vec2 base = v_uv - 1.5 * px;
+        for (int dy = 0; dy < 4; dy++) {
+            for (int dx = 0; dx < 4; dx++) {
+                acc += texture(u_state, base + vec2(float(dx), float(dy)) * px).r;
+            }
+        }
+        frag = vec4(acc / 16.0, 0.0, 0.0, 1.0);
+    }
 }
 """
 
@@ -417,7 +444,13 @@ def make_program(ctx, fragment):
 
 class Chunk:
     """Rectangle de monde autonome : textures ping-pong pour la sim et une
-    texture de réduction pour compter les vivantes (et détecter la bbox active)."""
+    texture de réduction pour compter les vivantes (et détecter la bbox active).
+
+    La reduce_tex est plafonnée à REDUCE_MAX² sinon une grille 16 k² en R32F
+    pèserait ~1 Go. Le reduce shader compense en faisant un box filter
+    u_scale×u_scale pour couvrir tous les pixels de state."""
+
+    REDUCE_MAX = 4096
 
     def __init__(self, ctx, width, height, initial=None):
         self.width = width
@@ -431,11 +464,21 @@ class Chunk:
         self.front_fbo = self.fbo_a
         self.back_tex  = self.tex_b
         self.back_fbo  = self.fbo_b
-        # R32F + mipmaps : compte des vivantes par moyenne récursive 2×2.
-        self.reduce_tex = ctx.texture((width, height), 1, dtype="f4")
+        # Facteur d'échelle entier tel que reduce_w,h restent ≤ REDUCE_MAX.
+        # Pour les tailles courantes du projet (grilles ≤ MAX_GRID_SIZE=16384),
+        # scale ∈ {1, 2, 4}. Le reduce shader a des branches spécialisées
+        # pour ces trois valeurs pour que GLSL déroule les taps.
+        max_dim = max(width, height)
+        self.reduce_scale = 1
+        while max_dim // self.reduce_scale > self.REDUCE_MAX:
+            self.reduce_scale *= 2
+        self.reduce_w = max(1, width  // self.reduce_scale)
+        self.reduce_h = max(1, height // self.reduce_scale)
+        self.reduce_tex = ctx.texture((self.reduce_w, self.reduce_h), 1, dtype="f4")
         self.reduce_tex.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
         self.reduce_fbo = ctx.framebuffer(color_attachments=[self.reduce_tex])
-        self.reduce_max_level = int(math.floor(math.log2(max(width, height))))
+        self.reduce_max_level = int(math.floor(math.log2(max(self.reduce_w,
+                                                             self.reduce_h))))
 
     def _make_state_tex(self, ctx, initial):
         t = ctx.texture((self.width, self.height), 2, dtype="f1")
@@ -1049,11 +1092,14 @@ def main():
         now = pygame.time.get_ticks()
         if now - counters["alive_at"] < 500:
             return
-        # 1) copie chunk.front.r dans chunk.reduce_tex (R32F)
+        # 1) copie chunk.front.r (éventuellement downsample scale×scale) dans
+        #    chunk.reduce_tex (R32F, plafonnée à REDUCE_MAX² pour borner la
+        #    VRAM et accélérer build_mipmaps sur grosses grilles).
         chunk.reduce_fbo.use()
-        ctx.viewport = (0, 0, chunk.width, chunk.height)
+        ctx.viewport = (0, 0, chunk.reduce_w, chunk.reduce_h)
         chunk.front_tex.use(0)
         reduce_prog["u_state"] = 0
+        reduce_prog["u_scale"] = chunk.reduce_scale
         reduce_vao.render(moderngl.TRIANGLE_STRIP)
         # 2) chaîne de mipmaps : chaque niveau moyenne 2x2 du précédent,
         #    le top-level (1×1) contient la moyenne de toutes les cellules.
@@ -1074,18 +1120,20 @@ def main():
         maybe_shrink()
 
     def update_sim_bbox():
-        # Niveau grossier : chaque texel agrège ~128×128 pixels. Sur un 16k×10k
-        # ça donne 128×80 texels = 40 KB à lire, ridicule côté coût.
+        # Niveau grossier de la mipmap : vise ~128 texels dans la plus grande
+        # dim de reduce_tex. Chaque texel reduce couvre reduce_scale × reduce_scale
+        # pixels de state ; chaque niveau de mipmap × 2 par axe.
         level = min(7, chunk.reduce_max_level - 1)
         if level < 0:
             sim_bbox["valid"] = False
             return
-        bw = max(1, chunk.width  >> level)
-        bh = max(1, chunk.height >> level)
+        bw = max(1, chunk.reduce_w >> level)
+        bh = max(1, chunk.reduce_h >> level)
         raw = chunk.reduce_tex.read(level=level)
         arr = np.frombuffer(raw, dtype=np.float32).reshape(bh, bw)
         nz = arr > 1e-6
-        block = 1 << level
+        # Un texel mipmap couvre (reduce_scale × 2^level) pixels de state.
+        block = chunk.reduce_scale << level
         if not nz.any():
             sim_bbox.update(valid=True, x0=0, y0=0, x1=0, y1=0)
             return
@@ -1094,8 +1142,7 @@ def main():
         y0 = int(ys.min()) * block
         x1 = (int(xs.max()) + 1) * block
         y1 = (int(ys.max()) + 1) * block
-        # Marge d'un bloc pour couvrir la propagation entre 2 updates (500 ms
-        # × 30 TPS × 1 cellule/tick = 15 cellules ≤ 128 de marge, safe).
+        # Marge d'un bloc (couvre la propagation entre 2 updates à 500 ms).
         x0 = max(0, x0 - block)
         y0 = max(0, y0 - block)
         x1 = min(chunk.width,  x1 + block)
@@ -1226,9 +1273,15 @@ def main():
             if not grow_chunk():
                 break
             alive = count_alive_direct()
-            check(f"pulsar after grow #{i+1}: alive preserved",
+            check(f"pulsar after grow #{i+1} (reduce_scale={chunk.reduce_scale}): alive preserved",
                   alive == pulsar_initial,
                   f"{pulsar_initial} -> {alive}")
+
+        # 7bis) Vérifie que reduce_scale est bien > 1 quand on a dépassé
+        #       REDUCE_MAX — sinon le cap n'est pas testé.
+        check(f"reduce_scale>1 after grows (actual {chunk.reduce_scale})",
+              chunk.reduce_scale >= 2,
+              f"grid is {chunk.width}x{chunk.height}, scale={chunk.reduce_scale}")
 
         # 8) update_alive_count (via mipmap) vs comptage direct : la mipmap
         #    perd en précision pour des densités <1e-5, mais sur un pulsar
