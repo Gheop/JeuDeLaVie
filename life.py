@@ -247,13 +247,37 @@ uniform sampler2D u_glow_h;
 uniform float u_time;
 uniform vec2  u_center;   // UV du centre de la vue
 uniform float u_zoom;     // largeur (en UV) visible à l'écran
+uniform int   u_palette;  // 0 nébuleuse, 1 feu, 2 glace, 3 gris, 4 arc-en-ciel
 in vec2 v_uv;
 out vec4 frag;
 
 vec3 palette(float t) {
-    vec3 a = vec3(0.18, 0.85, 0.95);
-    vec3 b = vec3(0.95, 0.30, 0.85);
-    return mix(a, b, smoothstep(0.0, 1.0, t));
+    t = smoothstep(0.0, 1.0, t);
+    if (u_palette == 1) {
+        // Feu : rouge sombre -> orange -> jaune -> blanc.
+        if (t < 0.33) return mix(vec3(0.15, 0.00, 0.00),
+                                 vec3(0.90, 0.25, 0.00), t / 0.33);
+        if (t < 0.66) return mix(vec3(0.90, 0.25, 0.00),
+                                 vec3(1.00, 0.80, 0.10), (t - 0.33) / 0.33);
+        return mix(vec3(1.00, 0.80, 0.10),
+                   vec3(1.00, 1.00, 0.90), (t - 0.66) / 0.34);
+    }
+    if (u_palette == 2) {
+        // Glace : bleu profond -> cyan -> blanc.
+        return mix(vec3(0.05, 0.15, 0.55), vec3(0.92, 0.97, 1.00), t);
+    }
+    if (u_palette == 3) {
+        // Gris pur.
+        return vec3(0.12 + 0.85 * t);
+    }
+    if (u_palette == 4) {
+        // Arc-en-ciel : teinte qui tourne avec l'âge (HSV→RGB rapide).
+        vec3 rgb = clamp(abs(mod(t * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0)
+                         - 1.0, 0.0, 1.0);
+        return 0.95 * mix(vec3(1.0), rgb, 0.75);
+    }
+    // Défaut (0) : nébuleuse cyan -> magenta.
+    return mix(vec3(0.18, 0.85, 0.95), vec3(0.95, 0.30, 0.85), t);
 }
 
 void main() {
@@ -634,6 +658,8 @@ def main():
         glow["size"] = (w, h)
 
     sim = {"rule_idx": 0}  # dict pour pouvoir muter depuis les closures
+    PALETTES = ["Nébuleuse", "Feu", "Glace", "Gris", "Arc-en-ciel"]
+    palette_state = {"idx": 0}
 
     # Rectangle englobant les cellules vivantes — recalculé depuis la mipmap
     # de reduce_tex toutes les 500 ms (cf. update_alive_count). Le sim est
@@ -1037,7 +1063,8 @@ def main():
         "SOURIS    gauche dessiner · droit effacer\n"
         "MOLETTE   zoom centré curseur · MILIEU drag = pan\n"
         "1 - 9     sélectionne un motif (Q/E rotation, clic gauche pose)\n"
-        "T         cycle des règles · ESPACE pause/play\n"
+        "T         cycle des règles · P cycle des palettes\n"
+        "ESPACE    pause/play\n"
         "R rand    C clear      Z reset vue      F plein écran\n"
         "+ / -     vitesse de simulation\n"
         "F5 / F9   save / load PNG (snapshots/)\n"
@@ -1237,11 +1264,12 @@ def main():
         ctx.viewport = (0, 0, w, h)
         chunk.front_tex.use(0)
         glow["tex"].use(1)
-        display_prog["u_state"]  = 0
-        display_prog["u_glow_h"] = 1
-        display_prog["u_time"]   = time_s
-        display_prog["u_center"] = center
-        display_prog["u_zoom"]   = zoom
+        display_prog["u_state"]   = 0
+        display_prog["u_glow_h"]  = 1
+        display_prog["u_time"]    = time_s
+        display_prog["u_center"]  = center
+        display_prog["u_zoom"]    = zoom
+        display_prog["u_palette"] = palette_state["idx"]
         display_vao.render(moderngl.TRIANGLE_STRIP)
 
     def _render_frame(sw, sh, time_s, with_help):
@@ -1500,6 +1528,9 @@ def main():
                 elif e.key == pygame.K_t:
                     sim["rule_idx"] = (sim["rule_idx"] + 1) % len(RULES)
                     flash_msg(f"Règle ▸ {RULES[sim['rule_idx']][0]}")
+                elif e.key == pygame.K_p:
+                    palette_state["idx"] = (palette_state["idx"] + 1) % len(PALETTES)
+                    flash_msg(f"Palette ▸ {PALETTES[palette_state['idx']]}")
                 elif e.key == pygame.K_q:
                     rotate_place(1)   # CCW
                 elif e.key == pygame.K_e:
