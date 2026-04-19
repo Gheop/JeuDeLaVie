@@ -1126,53 +1126,52 @@ def main():
         reduce_prog["u_state"] = 0
         reduce_prog["u_scale"] = chunk.reduce_scale
         reduce_vao.render(moderngl.TRIANGLE_STRIP)
-        # 2) chaîne de mipmaps : chaque niveau moyenne 2x2 du précédent,
-        #    le top-level (1×1) contient la moyenne de toutes les cellules.
+        # 2) chaîne de mipmaps : nécessaire pour lire le niveau coarse.
         chunk.reduce_tex.build_mipmaps()
-        # 3) lecture du top-level (4 octets) — pas de readback de toute la grille
-        raw = chunk.reduce_tex.read(level=chunk.reduce_max_level)
-        fraction = float(np.frombuffer(raw, dtype=np.float32)[0])
-        counters["alive"] = int(round(fraction * chunk.width * chunk.height))
-        counters["alive_at"] = now
-        # 4) on en profite pour recalculer la bbox vivante à un niveau coarse
-        #    de la mipmap (un texel = ~128 cellules), utilisée par step() pour
-        #    scissor le sim — évite de chauffer toute la grille quand la vie
-        #    n'occupe qu'une portion du monde.
-        update_sim_bbox()
-        # 5) tant qu'on est là, si la grille s'est agrandie (grow) mais que
-        #    la vie + la vue tiennent toutes deux dans le quart central, on
-        #    rétrécit : ça rend les FPS nominaux après un dezoom-puis-rezoom.
-        maybe_shrink()
-
-    def update_sim_bbox():
-        # Niveau grossier de la mipmap : vise ~128 texels dans la plus grande
-        # dim de reduce_tex. Chaque texel reduce couvre reduce_scale × reduce_scale
-        # pixels de state ; chaque niveau de mipmap × 2 par axe.
-        level = min(7, chunk.reduce_max_level - 1)
+        # 3) Lecture unique d'un niveau de mipmap qui nous donne d'un coup :
+        #    le compte des vivantes (sum des texels × cells/texel) ET la bbox
+        #    active (positions des texels non-nuls). Évite un 2e readback et,
+        #    crucial, contourne la perte de précision de glGenerateMipmap sur
+        #    Mesa — aux niveaux trop élevés les texels deviennent 0 avant
+        #    d'atteindre le level=max pour les grilles sparse. On vise ≤ 5
+        #    pour garder une sum précise tout en restant bon marché (≈ 200
+        #    texels max à lire, soit < 1 KB).
+        level = min(5, chunk.reduce_max_level - 1)
         if level < 0:
             sim_bbox["valid"] = False
+            counters["alive"] = 0
+            counters["alive_at"] = now
+            maybe_shrink()
             return
         bw = max(1, chunk.reduce_w >> level)
         bh = max(1, chunk.reduce_h >> level)
         raw = chunk.reduce_tex.read(level=level)
         arr = np.frombuffer(raw, dtype=np.float32).reshape(bh, bw)
-        nz = arr > 1e-6
         # Un texel mipmap couvre (reduce_scale × 2^level) pixels de state.
         block = chunk.reduce_scale << level
+        cells_per_texel = block * block
+        counters["alive"]    = int(round(arr.sum() * cells_per_texel))
+        counters["alive_at"] = now
+        # 4) bbox à partir du même tableau
+        nz = arr > 1e-6
         if not nz.any():
             sim_bbox.update(valid=True, x0=0, y0=0, x1=0, y1=0)
-            return
-        ys, xs = np.where(nz)
-        x0 = int(xs.min()) * block
-        y0 = int(ys.min()) * block
-        x1 = (int(xs.max()) + 1) * block
-        y1 = (int(ys.max()) + 1) * block
-        # Marge d'un bloc (couvre la propagation entre 2 updates à 500 ms).
-        x0 = max(0, x0 - block)
-        y0 = max(0, y0 - block)
-        x1 = min(chunk.width,  x1 + block)
-        y1 = min(chunk.height, y1 + block)
-        sim_bbox.update(valid=True, x0=x0, y0=y0, x1=x1, y1=y1)
+        else:
+            ys, xs = np.where(nz)
+            x0 = int(xs.min()) * block
+            y0 = int(ys.min()) * block
+            x1 = (int(xs.max()) + 1) * block
+            y1 = (int(ys.max()) + 1) * block
+            # Marge d'un bloc (couvre la propagation entre 2 updates à 500 ms).
+            x0 = max(0, x0 - block)
+            y0 = max(0, y0 - block)
+            x1 = min(chunk.width,  x1 + block)
+            y1 = min(chunk.height, y1 + block)
+            sim_bbox.update(valid=True, x0=x0, y0=y0, x1=x1, y1=y1)
+        # 5) tant qu'on est là, si la grille s'est agrandie (grow) mais que
+        #    la vie + la vue tiennent toutes deux dans le quart central, on
+        #    rétrécit : ça rend les FPS nominaux après un dezoom-puis-rezoom.
+        maybe_shrink()
 
     def flash_msg(text, ms=1500):
         flash["text"] = text
@@ -1319,18 +1318,14 @@ def main():
               chunk.reduce_scale >= 2,
               f"grid is {chunk.width}x{chunk.height}, scale={chunk.reduce_scale}")
 
-        # 8) update_alive_count (via mipmap) vs comptage direct : la mipmap
-        #    perd en précision pour des densités <1e-5, mais sur un pulsar
-        #    dans une grille 8×, la densité reste ~4e-6. Tolérance large.
+        # 8) update_alive_count (via mipmap) vs comptage direct.
         counters["alive_at"] = -10_000
         update_alive_count()
         mip_alive = counters["alive"]
         direct_alive = count_alive_direct()
-        # On accepte une erreur relative <50% ou absolue <200 (la mipmap peut
-        # arrondir fort sur grilles sparses).
         err = abs(mip_alive - direct_alive)
-        ok = err < max(200, direct_alive * 0.5)
-        check(f"mipmap vs direct: |{mip_alive}-{direct_alive}|<tol", ok,
+        ok = err < max(10, direct_alive * 0.5)
+        check(f"mipmap vs direct: |{mip_alive}-{direct_alive}|<=tol", ok,
               f"direct={direct_alive} mip={mip_alive} err={err}")
 
         # Reset propre et sortie
