@@ -455,12 +455,20 @@ def random_state(w, h, density=0.25):
 def main():
     pygame.init()
     pygame.display.set_caption("Jeu de la Vie — GPU")
-    flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    windowed_flags   = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
+    fullscreen_flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
     pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK,
                                     pygame.GL_CONTEXT_PROFILE_CORE)
-    screen = pygame.display.set_mode((WIN_W, WIN_H), flags)
+    # Démarre en plein écran par défaut (F pour basculer en fenêtré).
+    # `--windowed` permet de forcer la fenêtre à la taille WIN_W×WIN_H.
+    start_windowed = "--windowed" in sys.argv
+    fullscreen = not start_windowed
+    if fullscreen:
+        screen = pygame.display.set_mode((0, 0), fullscreen_flags)
+    else:
+        screen = pygame.display.set_mode((WIN_W, WIN_H), windowed_flags)
 
     ctx = moderngl.create_context()
     ctx.enable(moderngl.BLEND)
@@ -515,6 +523,11 @@ def main():
     sim = {"rule_idx": 0}  # dict pour pouvoir muter depuis les closures
 
     def step():
+        # Rien à simuler si tout est mort : le shader Conway ne peut pas
+        # produire de la vie à partir du vide, donc on peut sauter le passe
+        # complet. Gain énorme sur une grille 16 k× après un C.
+        if counters["alive"] == 0:
+            return
         chunk.back_fbo.use()
         ctx.viewport = (0, 0, chunk.width, chunk.height)
         chunk.front_tex.use(0)
@@ -548,12 +561,42 @@ def main():
         paint_prog["u_aspect"] = chunk.width / chunk.height
         paint_vao.render(moderngl.TRIANGLE_STRIP)
         ctx.scissor = None
+        # Force un recalcul rapide des vivantes : value=1 vient d'ajouter au
+        # moins une cellule, donc step() ne doit pas skipper.
+        counters["alive"]    = max(1, counters["alive"]) if value > 0 else counters["alive"]
+        counters["alive_at"] = 0
 
     def clear_grid():
         chunk.clear()
+        counters["alive"]    = 0
+        counters["alive_at"] = pygame.time.get_ticks()
 
     def randomize():
         chunk.randomize()
+        # Estimation provisoire en attendant le reduce mipmap ; max(1, ...)
+        # suffirait mais on donne une valeur plausible pour le HUD.
+        counters["alive"]    = int(0.25 * chunk.width * chunk.height)
+        counters["alive_at"] = 0
+
+    def reset_world():
+        """Rétrécit la grille à sa taille initiale et recentre la vue.
+        Déclenché par la touche C : remet à zéro le monde pour retrouver
+        les FPS nominaux même après avoir dézoomé à fond."""
+        nonlocal chunk
+        if chunk.width != init_w or chunk.height != init_h:
+            for obj in (chunk.tex_a, chunk.tex_b, chunk.fbo_a, chunk.fbo_b,
+                        chunk.reduce_tex, chunk.reduce_fbo):
+                obj.release()
+            chunk = Chunk(ctx, init_w, init_h)
+            update_zoom_min()
+        else:
+            chunk.clear()
+        for k in ("cx", "cy", "tcx", "tcy"):
+            view[k] = 0.5
+        view["zoom"]  = 1.0
+        view["tzoom"] = 1.0
+        counters["alive"]    = 0
+        counters["alive_at"] = pygame.time.get_ticks()
 
     # vue : current = ce qui est affiché ; target = vers quoi on glisse.
     # cx, cy : UV du centre de la vue. zoom : largeur (en UV) visible.
@@ -671,6 +714,8 @@ def main():
             stamp_prog["u_pattern_size"] = (w / chunk.width, h / chunk.height)
             stamp_vao.render(moderngl.TRIANGLE_STRIP)
             chunk.swap()
+            counters["alive"]    = max(1, counters["alive"])
+            counters["alive_at"] = 0
         finally:
             tex.release()
 
@@ -712,13 +757,14 @@ def main():
         buf[..., 0] = alive
         buf[..., 1] = alive
         chunk.front_tex.write(buf.tobytes())
+        counters["alive"]    = int((alive > 0).sum())
+        counters["alive_at"] = 0
         return path
 
     clock = pygame.time.Clock()
     paused = False
     tps = INITIAL_TPS
     sim_accum = 0.0
-    fullscreen = False
     panning = False
     pan_last = (0, 0)
     flash = {"text": "", "until": 0}    # message éphémère (HUD)
@@ -997,7 +1043,9 @@ def main():
                     randomize()
                     counters["gen"] = 0
                 elif e.key == pygame.K_c:
-                    clear_grid()
+                    # Nettoie ET rétrécit la grille à la taille initiale : plus
+                    # de grille géante qui pèse sur les FPS après un dézoom.
+                    reset_world()
                     counters["gen"] = 0
                 elif e.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     tps = min(240, tps + 5)
@@ -1005,8 +1053,10 @@ def main():
                     tps = max(1, tps - 5)
                 elif e.key == pygame.K_f:
                     fullscreen = not fullscreen
-                    flags2 = flags | (pygame.FULLSCREEN if fullscreen else 0)
-                    pygame.display.set_mode((WIN_W, WIN_H), flags2)
+                    if fullscreen:
+                        pygame.display.set_mode((0, 0), fullscreen_flags)
+                    else:
+                        pygame.display.set_mode((WIN_W, WIN_H), windowed_flags)
                 elif e.key == pygame.K_z:
                     view["tcx"], view["tcy"], view["tzoom"] = 0.5, 0.5, 1.0
                 elif e.key == pygame.K_h:
