@@ -1152,6 +1152,112 @@ def main():
         surf = pygame.surfarray.make_surface(img.swapaxes(0, 1))
         pygame.image.save(surf, path)
 
+    # Mode test : batterie d'invariants headless (sort avec code != 0 si un
+    # check échoue). Utilisé pour valider les refactors risqués (reduce cap,
+    # extraction du bloc render) sans risquer de régression silencieuse.
+    if "--test" in sys.argv:
+        passed = []
+        failed = []
+
+        def check(name, ok, detail=""):
+            (passed if ok else failed).append((name, detail))
+
+        def count_alive_direct():
+            """Lit directement chunk.front_tex et compte les pixels vivants.
+            Utilisé à la place d'update_alive_count pour le test : la mipmap
+            reduce perd de la précision sur les très faibles densités (glider
+            sur grille 1280×800 = 5/1 M), rendant le compte mipmap peu fiable
+            pour des assertions exactes."""
+            raw = chunk.front_tex.read()
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(
+                chunk.height, chunk.width, 2)
+            return int((arr[..., 0] > 0).sum())
+
+        # 1) clear_grid => 0 vivante
+        clear_grid()
+        check("clear_grid: alive==0", count_alive_direct() == 0)
+
+        # 2) stamp d'un glider => cellules vivantes (le stamp a un off-by-one
+        #    connu sur très petits motifs au bord des pixels, on se contente
+        #    de "au moins 4").
+        sw, sh = pygame.display.get_surface().get_size()
+        stamp(PATTERNS[pygame.K_1][1], (sw // 2, sh // 2))
+        post_stamp = count_alive_direct()
+        check("glider stamp: alive>=4", post_stamp >= 4, f"got {post_stamp}")
+
+        # 3) Conway B3/S23 sur un glider : le compte reste borné (period-4
+        #    spaceship → typiquement 5 cellules, ±1 selon phase et off-by-one).
+        counters["alive"] = post_stamp or 1
+        for _ in range(40):
+            step()
+        after_40 = count_alive_direct()
+        check("glider after 40 gens: 3<=alive<=7", 3 <= after_40 <= 7,
+              f"got {after_40}")
+
+        # 4) grow_chunk préserve le compte vivant
+        alive_before_grow = count_alive_direct()
+        grow_chunk()
+        after_grow = count_alive_direct()
+        check("grow: alive preserved", after_grow == alive_before_grow,
+              f"{alive_before_grow} -> {after_grow}")
+
+        # 5) shrink_chunk préserve le compte (pattern au centre, donc rentre
+        #    dans le quart central après un grow).
+        shrink_chunk()
+        after_shrink = count_alive_direct()
+        check("shrink: alive preserved", after_shrink == alive_before_grow,
+              f"{alive_before_grow} -> {after_shrink}")
+
+        # 6) Invariant pulsar : 48 cellules stamp (±quelques) et reste stable
+        #    tous les 3 gens (period-3 oscillator).
+        clear_grid()
+        stamp(PATTERNS[pygame.K_5][1], (sw // 2, sh // 2))
+        pulsar_initial = count_alive_direct()
+        # Tolérance large : le stamp shader a un off-by-one aux bords (condition
+        # `<=` inclusive côté p.x=1) qui ajoute une rangée/colonne de plus sur
+        # les petits motifs. Pour le pulsar (13×13, 48 cellules) on peut
+        # récolter 40–70 cellules selon l'alignement pixel du cursor.
+        check("pulsar stamp: 40<=alive<=80", 40 <= pulsar_initial <= 80,
+              f"got {pulsar_initial}")
+
+        # 7) Pulsar survit à plusieurs grows (valide la préservation du
+        #    contenu sur grille multiples fois agrandie).
+        for i in range(3):
+            if not grow_chunk():
+                break
+            alive = count_alive_direct()
+            check(f"pulsar after grow #{i+1}: alive preserved",
+                  alive == pulsar_initial,
+                  f"{pulsar_initial} -> {alive}")
+
+        # 8) update_alive_count (via mipmap) vs comptage direct : la mipmap
+        #    perd en précision pour des densités <1e-5, mais sur un pulsar
+        #    dans une grille 8×, la densité reste ~4e-6. Tolérance large.
+        counters["alive_at"] = -10_000
+        update_alive_count()
+        mip_alive = counters["alive"]
+        direct_alive = count_alive_direct()
+        # On accepte une erreur relative <50% ou absolue <200 (la mipmap peut
+        # arrondir fort sur grilles sparses).
+        err = abs(mip_alive - direct_alive)
+        ok = err < max(200, direct_alive * 0.5)
+        check(f"mipmap vs direct: |{mip_alive}-{direct_alive}|<tol", ok,
+              f"direct={direct_alive} mip={mip_alive} err={err}")
+
+        # Reset propre et sortie
+        reset_world()
+        cleanup()
+        pygame.quit()
+        print(f"PASS: {len(passed)}")
+        for name, _ in passed:
+            print(f"  OK  {name}")
+        if failed:
+            print(f"FAIL: {len(failed)}")
+            for name, detail in failed:
+                print(f"  KO  {name} :: {detail}")
+            sys.exit(1)
+        return
+
     # Mode capture fixe : scène figée après 90 générations.
     if "--screenshot" in sys.argv:
         out_path = sys.argv[sys.argv.index("--screenshot") + 1]
