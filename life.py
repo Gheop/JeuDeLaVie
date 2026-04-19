@@ -32,7 +32,7 @@ import moderngl
 
 
 WIN_W, WIN_H = 1280, 800
-GRID_W, GRID_H = 512, 320          # résolution de la simulation
+GRID_W, GRID_H = 2048, 1280        # résolution de la simulation
 INITIAL_TPS = 30                    # ticks de simulation par seconde
 
 
@@ -50,6 +50,9 @@ void main() {
 # meurt (sert à la traînée). La texture est en RG8 (unorm) — GLSL lit les
 # échantillons comme des floats 0..1, on divise la bande passante par 8 vs
 # l'ancien RGBA32F sans modifier les shaders.
+# Les voisins hors grille sont considérés morts (monde fini, pas de wrap
+# toroïdal) : un vaisseau qui sort disparaît au lieu de revenir par l'autre
+# côté.
 # u_birth / u_survive : bitmasks (bit i = comportement avec i voisines).
 SIM_SHADER = """
 #version 330
@@ -66,7 +69,9 @@ void main() {
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
-            n += int(texture(u_state, v_uv + vec2(dx, dy) * px).r > 0.5);
+            vec2 nb = v_uv + vec2(dx, dy) * px;
+            if (nb.x < 0.0 || nb.x > 1.0 || nb.y < 0.0 || nb.y > 1.0) continue;
+            n += int(texture(u_state, nb).r > 0.5);
         }
     }
     int mask = (c > 0.5) ? u_survive : u_birth;
@@ -102,8 +107,8 @@ void main() {
 
 # Stamp d'un motif sur la grille, entièrement GPU (évite un aller-retour
 # lecture/écriture numpy). Le motif est uploadé dans u_pattern ; on sample
-# l'état d'entrée puis on écrase là où le motif est à 1. `fract(d + 0.5) - 0.5`
-# assure le wrap toroïdal sans logique spéciale aux bords.
+# l'état d'entrée puis on écrase là où le motif est à 1. Pas de wrap : un
+# motif posé près d'un bord est clippé (cohérent avec la sim finie).
 STAMP_SHADER = """
 #version 330
 uniform sampler2D u_state;
@@ -116,7 +121,6 @@ out vec4 frag;
 void main() {
     vec4 cur = texture(u_state, v_uv);
     vec2 d = v_uv - u_cursor_tex;
-    d = fract(d + 0.5) - 0.5;
     vec2 p = d / u_pattern_size + 0.5;
     if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) {
         float a = texture(u_pattern, p).r;
@@ -159,7 +163,11 @@ void main() {
     float acc = 0.0, wsum = 0.0;
     for (int dx = -3; dx <= 3; dx++) {
         float w = exp(-float(dx*dx) / 6.0);
-        acc  += texture(u_state, uv + vec2(float(dx) * pxx, 0.0)).g * w;
+        vec2 nb = uv + vec2(float(dx) * pxx, 0.0);
+        // Hors grille = 0 pour éviter que le glow ne tile avec la texture.
+        float g = (nb.x < 0.0 || nb.x > 1.0 || nb.y < 0.0 || nb.y > 1.0)
+                  ? 0.0 : texture(u_state, nb).g;
+        acc  += g * w;
         wsum += w;
     }
     frag = vec4(acc / wsum, 0.0, 0.0, 1.0);
@@ -186,7 +194,8 @@ vec3 palette(float t) {
 
 void main() {
     vec2 uv = (v_uv - 0.5) * u_zoom + u_center;
-    vec4 s  = texture(u_state, uv);
+    bool in_grid = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    vec4 s  = in_grid ? texture(u_state, uv) : vec4(0.0);
 
     float pxy = u_zoom / float(textureSize(u_state, 0).y);
     float glow = 0.0, wsum = 0.0;
@@ -203,7 +212,10 @@ void main() {
     vec3 cell = palette(age) * (0.55 + 0.45 * age);
     vec3 halo = palette(0.65) * glow * 1.4;
 
-    vec3 bg = mix(vec3(0.02, 0.025, 0.05), vec3(0.05, 0.04, 0.10), v_uv.y);
+    // Fond de base + léger assombrissement hors de la grille pour marquer la limite.
+    vec3 bg_in  = mix(vec3(0.02, 0.025, 0.05), vec3(0.05, 0.04, 0.10), v_uv.y);
+    vec3 bg_out = bg_in * 0.55;
+    vec3 bg = in_grid ? bg_in : bg_out;
     vec3 col = bg + halo + cell * alive;
 
     vec2 q = v_uv - 0.5;
@@ -409,7 +421,8 @@ def main():
         # RG8 : R = alive (0/255), G = age (0..255). 2 o/cellule au lieu de 16.
         tex = ctx.texture((GRID_W, GRID_H), 2, dtype="f1")
         tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        tex.repeat_x = tex.repeat_y = True
+        # Pas de wrap : monde fini, les bords sont absorbants (cf. SIM_SHADER).
+        tex.repeat_x = tex.repeat_y = False
         if initial is not None:
             tex.write(initial.tobytes())
         return tex
@@ -632,6 +645,10 @@ def main():
 
     # tracé continu : on interpole entre la dernière position connue et la courante
     stroke = {"last": None, "value": None}
+    # Après une pose de motif (ou une annulation clic droit), on bloque le
+    # tracé continu jusqu'à ce que tous les boutons soient relâchés — sinon
+    # le bouton gauche encore enfoncé déclencherait immédiatement un paint.
+    suppress_paint_until_release = False
 
     # compteurs pour le HUD
     counters = {"gen": 0, "alive": 0, "alive_at": 0}
@@ -923,8 +940,10 @@ def main():
                     if e.button == 1:
                         stamp(place["pattern"], e.pos)
                         exit_place()
+                        suppress_paint_until_release = True
                     elif e.button == 3:
                         exit_place()
+                        suppress_paint_until_release = True
             elif e.type == pygame.MOUSEBUTTONUP and e.button == 2:
                 panning = False
             elif e.type == pygame.MOUSEMOTION and panning:
@@ -940,6 +959,13 @@ def main():
         # tracé continu (désactivé en mode placement, c'est le clic qui pose)
         if place["pattern"] is None:
             buttons = pygame.mouse.get_pressed()
+            # Si on sort tout juste du mode placement avec un bouton encore
+            # enfoncé, on attend son relâchement pour ne pas peindre aussitôt
+            # par-dessus le motif qu'on vient de poser.
+            if suppress_paint_until_release:
+                if not (buttons[0] or buttons[2]):
+                    suppress_paint_until_release = False
+                buttons = (False, buttons[1], False)
             if buttons[0] or buttons[2]:
                 pos = pygame.mouse.get_pos()
                 val = 0.0 if buttons[2] else 1.0

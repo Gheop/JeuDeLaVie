@@ -135,7 +135,9 @@ frame — use it to speed up long-running scenes without making the GIF huge.
 | 8 | R-pentomino (methuselah) |
 | 9 | Acorn (methuselah) |
 
-The grid is toroidal, so patterns placed near the edges wrap around cleanly.
+The world is finite: cells that reach a border die (no toroidal wrap), so
+spaceships fly off instead of reappearing on the opposite side. The default
+grid is 2048 × 1280 so you have plenty of room to zoom out.
 
 ## Rules
 
@@ -191,12 +193,28 @@ A few constants at the top of `life.py` are worth playing with:
 
 | Constant | Default | Effect |
 |---|---|---|
-| `GRID_W`, `GRID_H` | 512 × 320 | Simulation resolution. Bumping to 1024×640 still runs comfortably on integrated GPUs. |
+| `GRID_W`, `GRID_H` | 2048 × 1280 | Simulation resolution. Drop to 1024×640 on weaker integrated GPUs. |
 | `INITIAL_TPS` | 30 | Starting simulation rate (ticks per second). |
 | `LERP_SPEED` | 18 | Camera responsiveness. Higher = snappier, lower = lazier. |
 | `ZOOM_MIN`, `ZOOM_MAX` | 0.02, 4.0 | How far in / out you can zoom. |
 
 ## Changelog
+
+### v0.2.0 — Bigger finite world (2026-04-19)
+
+- Default grid bumped from 512×320 to **2048×1280** — zoom out now reveals
+  empty space around the world instead of a tiled repeat of the grid.
+- Simulation is no longer toroidal: out-of-grid neighbors count as dead, so
+  spaceships leaving through a border disappear instead of wrapping to the
+  opposite side.
+- Rendering shaders (`DISPLAY`, `GLOW_H`) mask out samples beyond the grid,
+  and a slightly darker background is drawn outside to make the boundary visible.
+- `STAMP_SHADER` no longer wraps either: patterns stamped near a border are clipped.
+- Pattern placement click no longer triggers a paint stroke when the left
+  button stays held down right after the stamp.
+- `run.sh` discovers `python3` from `PATH` (or `$PYTHON`) instead of a
+  hardcoded pyenv install path, and only prepends `~/.local/lib` to
+  `LD_LIBRARY_PATH` when that directory actually exists.
 
 ### GPU perf pass
 
