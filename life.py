@@ -374,6 +374,51 @@ def make_program(ctx, fragment):
     return ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=fragment)
 
 
+class Chunk:
+    """Rectangle de monde autonome : textures ping-pong pour la sim et une
+    texture de réduction pour compter les vivantes. Posé ici en prévision
+    d'un monde chunked (étapes 2 et 3). Pour le moment on en instancie un
+    seul qui couvre la totalité de la grille."""
+
+    def __init__(self, ctx, width, height, initial=None):
+        self.width = width
+        self.height = height
+        # Ping-pong RG8 : R = alive, G = age normalisé.
+        self.tex_a = self._make_state_tex(ctx, initial)
+        self.tex_b = self._make_state_tex(ctx, None)
+        self.fbo_a = ctx.framebuffer(color_attachments=[self.tex_a])
+        self.fbo_b = ctx.framebuffer(color_attachments=[self.tex_b])
+        self.front_tex = self.tex_a
+        self.front_fbo = self.fbo_a
+        self.back_tex  = self.tex_b
+        self.back_fbo  = self.fbo_b
+        # R32F + mipmaps : compte des vivantes par moyenne récursive 2×2.
+        self.reduce_tex = ctx.texture((width, height), 1, dtype="f4")
+        self.reduce_tex.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
+        self.reduce_fbo = ctx.framebuffer(color_attachments=[self.reduce_tex])
+        self.reduce_max_level = int(math.floor(math.log2(max(width, height))))
+
+    def _make_state_tex(self, ctx, initial):
+        t = ctx.texture((self.width, self.height), 2, dtype="f1")
+        t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        # Bords absorbants : la sim compte les voisins hors grille comme morts.
+        t.repeat_x = t.repeat_y = False
+        if initial is not None:
+            t.write(initial.tobytes())
+        return t
+
+    def swap(self):
+        self.front_tex, self.back_tex = self.back_tex, self.front_tex
+        self.front_fbo, self.back_fbo = self.back_fbo, self.front_fbo
+
+    def clear(self):
+        zeros = np.zeros((self.height, self.width, 2), dtype=np.uint8)
+        self.front_tex.write(zeros.tobytes())
+
+    def randomize(self, density=0.25):
+        self.front_tex.write(random_state(self.width, self.height, density).tobytes())
+
+
 def random_state(w, h, density=0.25):
     """État aléatoire en RG8 : shape (h, w, 2), uint8. R = alive, G = age."""
     mask = (np.random.random((h, w)) < density).astype(np.uint8) * 255
@@ -417,33 +462,9 @@ def main():
     preview_vao = ctx.simple_vertex_array(preview_prog, quad, "in_pos")
     hud_vao     = ctx.simple_vertex_array(hud_prog,     quad, "in_pos")
 
-    def make_tex(initial=None):
-        # RG8 : R = alive (0/255), G = age (0..255). 2 o/cellule au lieu de 16.
-        tex = ctx.texture((GRID_W, GRID_H), 2, dtype="f1")
-        tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        # Pas de wrap : monde fini, les bords sont absorbants (cf. SIM_SHADER).
-        tex.repeat_x = tex.repeat_y = False
-        if initial is not None:
-            tex.write(initial.tobytes())
-        return tex
-
-    tex_a = make_tex(random_state(GRID_W, GRID_H))
-    tex_b = make_tex(np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8))
-    fbo_a = ctx.framebuffer(color_attachments=[tex_a])
-    fbo_b = ctx.framebuffer(color_attachments=[tex_b])
-
-    state = {"front": (tex_a, fbo_a), "back": (tex_b, fbo_b)}
-
-    def swap():
-        state["front"], state["back"] = state["back"], state["front"]
-
-    # Réduction pour compter les vivantes : texture R32F à la résolution de
-    # la grille + chaîne de mipmaps. Lire le top-level 1×1 donne la fraction
-    # de cellules vivantes, qu'on multiplie par GRID_W*GRID_H.
-    reduce_tex = ctx.texture((GRID_W, GRID_H), 1, dtype="f4")
-    reduce_tex.filter = (moderngl.LINEAR_MIPMAP_NEAREST, moderngl.LINEAR)
-    reduce_fbo = ctx.framebuffer(color_attachments=[reduce_tex])
-    reduce_max_level = int(math.floor(math.log2(max(GRID_W, GRID_H))))
+    # Pour l'instant : un unique chunk qui couvre toute la grille, instancié
+    # avec un bruit initial. Prochaine étape : plusieurs chunks indexés par (cx, cy).
+    chunk = Chunk(ctx, GRID_W, GRID_H, initial=random_state(GRID_W, GRID_H))
 
     # Passe H du glow : texture R8 à la résolution écran, recréée à la volée
     # quand la taille change.
@@ -465,36 +486,31 @@ def main():
     sim = {"rule_idx": 0}  # dict pour pouvoir muter depuis les closures
 
     def step():
-        front_tex, _ = state["front"]
-        _, back_fbo = state["back"]
-        back_fbo.use()
-        ctx.viewport = (0, 0, GRID_W, GRID_H)
-        front_tex.use(0)
+        chunk.back_fbo.use()
+        ctx.viewport = (0, 0, chunk.width, chunk.height)
+        chunk.front_tex.use(0)
         sim_prog["u_state"]   = 0
         sim_prog["u_birth"]   = RULES[sim["rule_idx"]][1]
         sim_prog["u_survive"] = RULES[sim["rule_idx"]][2]
         sim_vao.render(moderngl.TRIANGLE_STRIP)
-        swap()
+        chunk.swap()
 
     def paint(uv, radius=0.012, value=1.0):
-        front_tex, _ = state["front"]
-        _, back_fbo = state["back"]
-        back_fbo.use()
-        ctx.viewport = (0, 0, GRID_W, GRID_H)
-        front_tex.use(0)
+        chunk.back_fbo.use()
+        ctx.viewport = (0, 0, chunk.width, chunk.height)
+        chunk.front_tex.use(0)
         paint_prog["u_state"] = 0
         paint_prog["u_center"] = uv
         paint_prog["u_radius"] = radius
         paint_prog["u_value"]  = value
         paint_vao.render(moderngl.TRIANGLE_STRIP)
-        swap()
+        chunk.swap()
 
     def clear_grid():
-        zeros = np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8)
-        state["front"][0].write(zeros.tobytes())
+        chunk.clear()
 
     def randomize():
-        state["front"][0].write(random_state(GRID_W, GRID_H).tobytes())
+        chunk.randomize()
 
     # vue : current = ce qui est affiché ; target = vers quoi on glisse.
     # cx, cy : UV du centre de la vue. zoom : largeur (en UV) visible.
@@ -553,18 +569,16 @@ def main():
         try:
             cx_uv, cy_uv = view_uv(pos)
             h, w = pattern.shape
-            front_tex = state["front"][0]
-            _, back_fbo = state["back"]
-            back_fbo.use()
-            ctx.viewport = (0, 0, GRID_W, GRID_H)
-            front_tex.use(0)
+            chunk.back_fbo.use()
+            ctx.viewport = (0, 0, chunk.width, chunk.height)
+            chunk.front_tex.use(0)
             tex.use(1)
             stamp_prog["u_state"]        = 0
             stamp_prog["u_pattern"]      = 1
             stamp_prog["u_cursor_tex"]   = (cx_uv, cy_uv)
-            stamp_prog["u_pattern_size"] = (w / GRID_W, h / GRID_H)
+            stamp_prog["u_pattern_size"] = (w / chunk.width, h / chunk.height)
             stamp_vao.render(moderngl.TRIANGLE_STRIP)
-            swap()
+            chunk.swap()
         finally:
             tex.release()
 
@@ -572,9 +586,8 @@ def main():
 
     def save_png():
         os.makedirs(SNAP_DIR, exist_ok=True)
-        front_tex = state["front"][0]
-        buf = np.frombuffer(front_tex.read(), dtype=np.uint8) \
-                .reshape(GRID_H, GRID_W, 2)
+        buf = np.frombuffer(chunk.front_tex.read(), dtype=np.uint8) \
+                .reshape(chunk.height, chunk.width, 2)
         # canal R = vivant ; on flip Y pour que l'image PNG soit "à l'endroit"
         img = np.flipud(buf[..., 0])
         rgb = np.stack([img, img, img], axis=-1)
@@ -603,10 +616,10 @@ def main():
         arr = pygame.surfarray.array3d(canvas).swapaxes(0, 1)  # (H, W, 3)
         alive = (arr[..., 0] > 127).astype(np.uint8) * 255
         alive = np.flipud(alive)  # PNG y=0 en haut → buffer y=0 en bas
-        buf = np.zeros((GRID_H, GRID_W, 2), dtype=np.uint8)
+        buf = np.zeros((chunk.height, chunk.width, 2), dtype=np.uint8)
         buf[..., 0] = alive
         buf[..., 1] = alive
-        state["front"][0].write(buf.tobytes())
+        chunk.front_tex.write(buf.tobytes())
         return path
 
     clock = pygame.time.Clock()
@@ -734,19 +747,19 @@ def main():
         now = pygame.time.get_ticks()
         if now - counters["alive_at"] < 500:
             return
-        # 1) copie state.r dans reduce_tex (R32F)
-        reduce_fbo.use()
-        ctx.viewport = (0, 0, GRID_W, GRID_H)
-        state["front"][0].use(0)
+        # 1) copie chunk.front.r dans chunk.reduce_tex (R32F)
+        chunk.reduce_fbo.use()
+        ctx.viewport = (0, 0, chunk.width, chunk.height)
+        chunk.front_tex.use(0)
         reduce_prog["u_state"] = 0
         reduce_vao.render(moderngl.TRIANGLE_STRIP)
         # 2) chaîne de mipmaps : chaque niveau moyenne 2x2 du précédent,
         #    le top-level (1×1) contient la moyenne de toutes les cellules.
-        reduce_tex.build_mipmaps()
+        chunk.reduce_tex.build_mipmaps()
         # 3) lecture du top-level (4 octets) — pas de readback de toute la grille
-        raw = reduce_tex.read(level=reduce_max_level)
+        raw = chunk.reduce_tex.read(level=chunk.reduce_max_level)
         fraction = float(np.frombuffer(raw, dtype=np.float32)[0])
-        counters["alive"] = int(round(fraction * GRID_W * GRID_H))
+        counters["alive"] = int(round(fraction * chunk.width * chunk.height))
         counters["alive_at"] = now
 
     def flash_msg(text, ms=1500):
@@ -767,7 +780,7 @@ def main():
         # passe H du glow (écrit dans glow["tex"])
         glow["fbo"].use()
         ctx.viewport = (0, 0, sw, sh)
-        state["front"][0].use(0)
+        chunk.front_tex.use(0)
         glow_h_prog["u_state"]  = 0
         glow_h_prog["u_center"] = (0.5, 0.5)
         glow_h_prog["u_zoom"]   = 1.0
@@ -776,7 +789,7 @@ def main():
         ctx.screen.use()
         ctx.viewport = (0, 0, sw, sh)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        state["front"][0].use(0)
+        chunk.front_tex.use(0)
         glow["tex"].use(1)
         display_prog["u_state"]  = 0
         display_prog["u_glow_h"] = 1
@@ -1014,7 +1027,7 @@ def main():
         # 0) passe H du glow (R8, résolution écran)
         glow["fbo"].use()
         ctx.viewport = (0, 0, w, h)
-        state["front"][0].use(0)
+        chunk.front_tex.use(0)
         glow_h_prog["u_state"]  = 0
         glow_h_prog["u_center"] = (view["cx"], view["cy"])
         glow_h_prog["u_zoom"]   = view["zoom"]
@@ -1025,7 +1038,7 @@ def main():
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
         # 1) composition finale (passe V + cellules + fond + vignette + dither)
-        state["front"][0].use(0)
+        chunk.front_tex.use(0)
         glow["tex"].use(1)
         display_prog["u_state"]  = 0
         display_prog["u_glow_h"] = 1
